@@ -60,6 +60,35 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 一键快捷命令现实域名分流：```printf '5\n2\n1\n后缀域名1 后缀域名2' | sb```
 
 
+### 本仓库与原版的区别
+
+本仓库基于 [yonggekkk/sing-box-yg](https://github.com/yonggekkk/sing-box-yg) 修改（Serv00/Hostuno 脚本未改动），主要区别如下：
+
+| 方面 | 原版 | 本仓库 |
+|---|---|---|
+| 脚本更新来源 | yonggekkk/sing-box-yg | yixuexiaoao/sing-box-yg（主菜单7更新后保留下列功能） |
+| 连接日志 | 只能用 journalctl 查看原始运行日志 | 主菜单17：每个连接的源IP、协议、访问目标、出站；按IP/目标统计；失败与主动探测记录；在线IP；日志 gzip 压缩归档、保留天数、按时间段删除 |
+| 流量统计 | 无 | 按源IP/访问地址/主域名/日期/小时/月份/协议统计；记录网卡流量 |
+| 泄露后处理 | 只能手动逐项修改 UUID、端口等 | 主菜单18：一键重置 UUID/Vmess路径/Reality密钥/订阅路径/端口，备份与校验失败自动回滚；定时重置；泄露检测 |
+| 远程管理 | 无 | 主菜单19：加密管理API（权限分级、IP白名单、防爆破、审计日志），配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 网页面板管理多台服务器，支持远程一键升级 |
+| 安装：端口 | 随机，或逐个协议输入 | 另可按顺序一次输入全部端口（空格分隔），逐项校验格式、占用与重复 |
+| 安装：结束输出 | 逐个协议显示链接与二维码，每项停顿2秒 | 统一列出全部节点链接、聚合节点、API信息；二维码在主菜单9查看 |
+| 安装：API | 无 | 第零步可选开启API |
+| 安装速度 | 每次下载 GeoIP/GeoSite 规则库，多处固定等待 | 规则库仅 1.10 内核后台下载，去掉无意义等待；主菜单的网络查询并行执行 |
+| 运行日志 | `journalctl`（Alpine 不支持） | 写入 `/etc/s-box/sing-box.log`，Alpine 也可查看；超过10MB自动轮转 |
+| 安装失败提示 | 只显示「Sing-box服务未运行」 | 显示 `sing-box check` 结果与最近日志 |
+| 自动化验证 | 无 | GitHub Actions：在真实 sing-box（最新正式版/测试版/1.10.7）上校验配置模板、systemd 启动、流量统计、远程升级与回滚；单元测试 |
+
+**修复的原版问题**（详见 [CHANGELOG.md](CHANGELOG.md)）：
+* 自定义端口时按退格键会把不可见字符写进端口，导致 Sing-box 无法启动（脚本强制 `stty erase ^H`）
+* 脚本自更新与 WARP-plus 程序下载使用 `--insecure`（不校验 HTTPS 证书），存在被中间人替换的风险
+* 删除 Hy2/Tuic 端口跳跃后提示不显示；Acme 证书申请失败判断错误；停止一种 Argo 隧道会删除另一种隧道正在使用的 cloudflared
+* armv7 下载 cloudflared 文件名错误；Hy2 分享链接出现空的 `pinSHA256=`；WARP-plus 菜单中的函数覆盖全局卸载函数；订阅路径为空时误删订阅目录
+* `app.js` 的 `/rp` 接口每次访问都会使 Node 进程崩溃
+* 端口与自定义 UUID 无格式校验；TG 推送参数未校验即写入以 root 运行的脚本
+
+**仍沿用原版的外部脚本**：Acme 证书（yonggekkk/acme-yg）、WARP（yonggekkk/warp-yg）、BBR（teddysun/across）在对应菜单中从其仓库在线下载运行，与原版一致。
+
 ### 新增功能（本仓库扩展）：连接访问日志 / 流量统计 / 防泄露参数重置 / 多服务器Web管理面板
 
 #### 一键安装流程

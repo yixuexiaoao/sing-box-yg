@@ -125,6 +125,31 @@ jobs:
           sleep 3
           systemctl is-active sing-box
 
+      - name: remote upgrade with detached restart and automatic rollback (sbagent)
+        if: matrix.core == 'latest'
+        run: |
+          mkdir -p /tmp/up && cp sb.sh sbagent.py version /tmp/up/
+          (cd /tmp/up && python3 -m http.server 18765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sudo cp sb.sh /usr/bin/sb
+          sudo python3 /etc/s-box/sbagent.py apiinstall --port 18080 > /dev/null
+          sleep 3; systemctl is-active sbagent
+          # 1) 正常升级：替换文件，由独立的 systemd 单元重启 agent
+          sudo SB_UPDATE_BASE=http://127.0.0.1:18765 python3 /etc/s-box/sbagent.py upgrade
+          sleep 20
+          st=$(systemctl is-active sbagent || true); echo "after upgrade: $st"
+          want=$(head -1 version | awk -F '更新内容' '{print $1}')
+          got=$(sudo cat /etc/s-box/v)
+          if [[ "$st" != active || "$got" != "$want" ]]; then echo "::error title=upgrade::state=$st version=$got want=$want"; sudo journalctl -u sbagent -n 20 --no-pager; exit 1; fi
+          # 2) 坏版本：能通过语法校验但启动即退出，应自动回滚
+          printf '%s
+' "$(sed 's/^def serve():/def serve():
+    raise SystemExit("boom")/' sbagent.py)" > /tmp/up/sbagent.py
+          sudo SB_UPDATE_BASE=http://127.0.0.1:18765 python3 /etc/s-box/sbagent.py upgrade
+          sleep 30
+          st=$(systemctl is-active sbagent || true); echo "after bad upgrade: $st"
+          if [[ "$st" != active ]] || sudo grep -q 'SystemExit("boom")' /etc/s-box/sbagent.py; then echo "::error title=rollback::sbagent not restored (state=$st)"; sudo journalctl -u sbagent -n 30 --no-pager; exit 1; fi
+          echo "rollback ok"
+
   agent:
     runs-on: ubuntu-latest
     steps:

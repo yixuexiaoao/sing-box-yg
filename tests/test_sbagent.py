@@ -39,7 +39,16 @@ else:
                           "exit 0\n")
     os.chmod(fake, 0o755)
 os.environ.update(SB_DIR=SB, SB_WEBDIR=os.path.join(T, "web"), SB_CMD=os.path.join(T, "nope"), SB_BIN=fake)
-spec = importlib.util.spec_from_file_location("sbagent", os.path.join(REPO, "sbagent.py"))
+# 在临时副本上运行：升级测试会替换 sbagent.py 自身，不能影响仓库文件
+AGENT = os.path.join(T, "sbagent.py")
+shutil.copy2(os.path.join(REPO, "sbagent.py"), AGENT)
+os.environ["SB_SCRIPT"] = os.path.join(T, "usr_bin_sb")
+if os.name == "nt" and not os.environ.get("SB_LIBCRYPTO"):
+    for d in (r"C:\Program Files\Git\mingw64\bin", r"C:\Program Files\Git\usr\bin"):
+        for f in ("libcrypto-3-x64.dll", "libcrypto-1_1-x64.dll"):
+            if os.path.exists(os.path.join(d, f)):
+                os.environ["SB_LIBCRYPTO"] = os.path.join(d, f)
+spec = importlib.util.spec_from_file_location("sbagent", AGENT)
 A = importlib.util.module_from_spec(spec); spec.loader.exec_module(A)
 fails = 0
 def check(c, msg):
@@ -221,5 +230,93 @@ for bad_v, fn in (("root", A.parse_perms), ("1.2.3.4/99", A.parse_allow)):
         fn(bad_v); check(False, "reject " + bad_v)
     except ValueError:
         check(True, "reject invalid " + bad_v)
+# ---------------- 5. AES：进程内 libcrypto 与 openssl 命令结果一致，密钥不出现在命令行
+import socket as _sk, subprocess as _sp
+lib = A._libcrypto()
+check(lib is not None, "libcrypto loaded via ctypes (" + str(os.environ.get("SB_LIBCRYPTO") or "system") + ")")
+key, iv = os.urandom(32), os.urandom(16)
+for size in (0, 1, 15, 16, 17, 4096, 100000):
+    data = os.urandom(size)
+    ct = A._aes_lib(lib, data, key, iv, False)
+    cli = _sp.run(["openssl", "enc", "-aes-256-cbc", "-K", key.hex(), "-iv", iv.hex()], input=data, stdout=_sp.PIPE).stdout
+    if ct != cli or A._aes_lib(lib, ct, key, iv, True) != data:
+        check(False, "AES ctypes == openssl cli, size %d" % size)
+        break
+else:
+    check(True, "AES ctypes output identical to openssl cli and round-trips (7 sizes)")
+try:
+    A._aes_lib(lib, A._aes_lib(lib, b"hello world" * 3, key, iv, False), os.urandom(32), iv, True)
+    check(False, "wrong key rejected")
+except ValueError:
+    check(True, "decrypt with wrong key fails (padding check)")
+
+# ---------------- 6. 远程升级：只用内置地址；校验失败不替换；成功则替换并备份
+import http.server as _hs
+files = {}
+
+
+class _H(_hs.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = files.get(self.path)
+        self.send_response(200 if body is not None else 404)
+        self.end_headers()
+        if body is not None:
+            self.wfile.write(body)
+
+
+hs = _hs.HTTPServer(("127.0.0.1", 0), _H)
+threading.Thread(target=hs.serve_forever, daemon=True).start()
+A.UPDATE_BASE = "http://127.0.0.1:%d" % hs.server_address[1]
+good_sb = b'#!/bin/bash\nexport sbrepo="x"\necho ok\n'
+new_agent = open(AGENT, "rb").read().replace(b'VERSION = "' + A.VERSION.encode() + b'"', b'VERSION = "9.9.9"')
+open(A.SB_SCRIPT, "wb").write(b"#!/bin/bash\n# old\n")
+before_agent = open(AGENT, "rb").read()
+ver = "v99.1更新内容：\nx".encode()
+for label, sb, ag in (("bad script", b"not a script", new_agent),
+                      ("script syntax error", b"#!/bin/bash\nsbrepo=x\nif then fi\n", new_agent),
+                      ("agent syntax error", good_sb, b'VERSION = "9.9.9"\ndef serve(:\n')):
+    files.update({"/sb.sh": sb, "/sbagent.py": ag, "/version": ver})
+    try:
+        A.do_upgrade()
+        check(False, "upgrade rejects " + label)
+    except (RuntimeError, SyntaxError):
+        check(open(AGENT, "rb").read() == before_agent and open(A.SB_SCRIPT, "rb").read() == b"#!/bin/bash\n# old\n",
+              "upgrade rejects %s, nothing replaced" % label)
+files.update({"/sb.sh": good_sb, "/sbagent.py": new_agent, "/version": ver})
+r = A.do_upgrade()
+check(r["to"] == {"script": "v99.1", "agent": "9.9.9"} and open(A.SB_SCRIPT, "rb").read() == good_sb
+      and open(AGENT, "rb").read() == new_agent and A.script_version() == "v99.1",
+      "upgrade replaces sb.sh + sbagent.py and records version")
+check(open(os.path.join(r["backup"], "sbagent.py"), "rb").read() == before_agent
+      and open(os.path.join(r["backup"], "sb"), "rb").read() == b"#!/bin/bash\n# old\n", "previous files backed up")
+check(not r["restarting"], "no restart when not running as a service")
+check(A.ACTIONS["upgrade"][0] == "manage", "upgrade requires manage permission")
+hs.shutdown()
+
+# ---------------- 7. 并发连接上限
+srv2 = A.make_server({"port": 0, "token": "t" * 20, "path": "/p", "listen": "127.0.0.1"})
+srv2._sem = threading.BoundedSemaphore(3)
+threading.Thread(target=srv2.serve_forever, daemon=True).start()
+held = [_sk.create_connection(("127.0.0.1", srv2.server_address[1])) for _ in range(3)]
+time.sleep(0.3)
+extra = _sk.create_connection(("127.0.0.1", srv2.server_address[1]))
+extra.settimeout(3)
+try:
+    dropped = extra.recv(10) == b""
+except (ConnectionResetError, ConnectionAbortedError):
+    dropped = True
+check(dropped, "connection beyond the concurrency limit is closed immediately")
+for c in held:
+    c.close()
+time.sleep(0.5)
+c = _sk.create_connection(("127.0.0.1", srv2.server_address[1]))
+c.sendall(b"GET / HTTP/1.0\r\n\r\n")
+resp = c.recv(100)
+c.close()
+check(resp.startswith(b"HTTP/1.0 404"), "server serves again after held connections close")
+srv2.shutdown()
 shutil.rmtree(T, ignore_errors=True)
 print("FAILS:", fails); sys.exit(1 if fails else 0)

@@ -3083,6 +3083,13 @@ readp "输入Telegram机器人Token: " token
 telegram_token=$token
 readp "输入Telegram机器人用户ID: " userid
 telegram_id=$userid
+# 参数会写入以 root 运行的推送脚本，必须校验格式
+if [[ ! $telegram_token =~ ^[0-9]{5,}:[A-Za-z0-9_-]{20,}$ ]]; then
+red "Token格式错误（形如 123456789:AAxxxx）" && tgsbshow && return
+fi
+if [[ ! $telegram_id =~ ^-?[0-9]{3,20}$ ]]; then
+red "用户ID格式错误（应为数字）" && tgsbshow && return
+fi
 echo '#!/bin/bash
 export LANG=en_US.UTF-8
 sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
@@ -3968,7 +3975,7 @@ rm /tmp/crontab.tmp
 
 lnsb(){
 rm -rf /usr/bin/sb
-curl -L -o /usr/bin/sb -# --retry 2 --insecure ${sbrepo}/sb.sh
+curl -fL -o /usr/bin/sb -# --retry 2 ${sbrepo}/sb.sh
 chmod +x /usr/bin/sb
 local rc=$?
 sbagentup
@@ -4320,7 +4327,7 @@ aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
 *) red "WARP-plus-Socks5暂不支持$(uname -m)架构" && return 1;;
 esac
-curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure ${sbrepo}/sbwpph_$cpu
+curl -fL -o /etc/s-box/sbwpph -# --retry 2 ${sbrepo}/sbwpph_$cpu
 chmod +x /etc/s-box/sbwpph
 fi
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null

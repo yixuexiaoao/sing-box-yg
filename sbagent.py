@@ -8,6 +8,8 @@
 import argparse
 import base64
 import collections
+import ctypes
+import ctypes.util
 import datetime
 import gzip
 import hashlib
@@ -17,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import socketserver
@@ -34,7 +37,9 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
+UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
+SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
 SB_BIN = os.environ.get("SB_BIN", os.path.join(SB_DIR, "sing-box"))
 SB_CMD = os.environ.get("SB_CMD", "/usr/bin/sb")
@@ -1411,6 +1416,111 @@ def traffic_info():
             "collector": (COLLECTOR.error or "ok") if COLLECTOR is not None else None}
 
 
+# ---------------------------------------------------------------- 远程升级（脚本 sb.sh 与 sbagent.py）
+# 只从内置的仓库地址（HTTPS，校验证书）下载，API 不接受任何下载地址参数；
+# 下载内容需通过 bash -n / Python 编译校验，替换前备份；重启后 sbagent 未能稳定运行则自动回滚。
+UPGRADE_LOCK = threading.Lock()
+
+
+def http_get(url, limit=8 * 1024 * 1024):
+    req = urllib.request.Request(url, headers={"User-Agent": "sbagent/" + VERSION})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError("下载内容过大：" + url)
+    return data
+
+
+def script_version():
+    return read(os.path.join(SB_DIR, "v")).strip()
+
+
+def first_version(text):
+    line = (text.splitlines() or [""])[0]
+    return line.split("更新内容")[0].strip()
+
+
+def check_script(data):
+    if not data.startswith(b"#!/bin/bash") or b"sbrepo=" not in data:
+        raise RuntimeError("下载的 sb.sh 内容异常")
+    tmp = os.path.join(SB_DIR, ".sb.sh.check")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        rc, out = runs(["bash", "-n", tmp]) if has("bash") else (0, "")
+    finally:
+        os.remove(tmp)
+    if rc != 0:
+        raise RuntimeError("下载的 sb.sh 语法校验失败：" + out[:200])
+
+
+def check_agent(data):
+    text = data.decode("utf-8")
+    m = re.search(r'^VERSION = "([^"]+)"', text, re.M)
+    if not m or "def serve(" not in text:
+        raise RuntimeError("下载的 sbagent.py 内容异常")
+    compile(text, "sbagent.py", "exec")
+    return m.group(1)
+
+
+def restart_detached(bdir):
+    """在独立进程/单元中重启 sbagent，失败则恢复备份（当前进程会随服务重启被结束）。"""
+    me = os.path.abspath(__file__)
+    q = shlex.quote
+    if is_alpine():
+        restart, active = "rc-service sbagent restart", "rc-service sbagent status | grep -q started"
+    else:
+        restart, active = "systemctl restart sbagent", "systemctl is-active --quiet sbagent"
+    # 启动即崩溃的版本会被 systemd 反复重启，单次检查可能恰好处于运行中：连续3次（6秒）都在运行才算成功
+    script = ("sleep 2; %s; sleep 4; ok=1; for i in 1 2 3; do sleep 2; %s || ok=0; done; "
+              "[ $ok = 1 ] || { cp -f %s %s; cp -f %s %s; %s; }" % (
+                  restart, active, q(os.path.join(bdir, "sbagent.py")), q(me), q(os.path.join(bdir, "sb")), q(SB_SCRIPT), restart))
+    if not is_alpine() and has("systemd-run"):
+        cmd = ["systemd-run", "--unit", "sbagent-upgrade-%d" % int(time.time()), "/bin/sh", "-c", script]
+        rc, out = runs(cmd)
+        if rc == 0:
+            return True
+    subprocess.Popen(["/bin/sh", "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return True
+
+
+def do_upgrade(p=None):
+    if not UPGRADE_LOCK.acquire(False):
+        raise RuntimeError("已有升级正在进行")
+    try:
+        sb_src = http_get(UPDATE_BASE + "/sb.sh")
+        ag_src = http_get(UPDATE_BASE + "/sbagent.py")
+        ver_txt = http_get(UPDATE_BASE + "/version").decode("utf-8", "replace")
+        check_script(sb_src)
+        new_agent = check_agent(ag_src)
+        new_script = first_version(ver_txt)
+        old = {"script": script_version(), "agent": VERSION}
+        bdir = os.path.join(SB_DIR, "backup", "upgrade-" + time.strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(bdir, exist_ok=True)
+        me = os.path.abspath(__file__)
+        shutil.copy2(me, os.path.join(bdir, "sbagent.py"))
+        if os.path.exists(SB_SCRIPT):
+            shutil.copy2(SB_SCRIPT, os.path.join(bdir, "sb"))
+        else:
+            with open(os.path.join(bdir, "sb"), "wb") as f:
+                f.write(sb_src)
+        _keep_backups(os.path.join(SB_DIR, "backup"), 10)
+        for path, data, mode in ((SB_SCRIPT, sb_src, 0o755), (me, ag_src, 0o644)):
+            tmp = path + ".new"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+        write(os.path.join(SB_DIR, "v"), new_script + "\n")
+        restarting = svc_active("sbagent")
+        if restarting:
+            restart_detached(bdir)
+        return {"from": old, "to": {"script": new_script, "agent": new_agent}, "restarting": restarting, "backup": bdir}
+    finally:
+        UPGRADE_LOCK.release()
+
+
 # ---------------------------------------------------------------- 状态
 _VER_CACHE = {}
 
@@ -1446,7 +1556,7 @@ def status(_p=None):
     if read(os.path.join(SB_DIR, "sbargoym.log")).strip():
         argo["fixed"] = read(os.path.join(SB_DIR, "sbargoym.log")).strip()
     return {
-        "agent": VERSION, "hostname": socket.gethostname(), "os": osname,
+        "agent": VERSION, "script_version": script_version(), "hostname": socket.gethostname(), "os": osname,
         "kernel": runs(["uname", "-r"])[1] if has("uname") else "",
         "uptime": int(float(up[0])) if up else 0, "load": read("/proc/loadavg").split()[:3], "mem": mem,
         "installed": bool(cfg), "active": svc_active("sing-box") if cfg else False,
@@ -1470,7 +1580,62 @@ def derive_keys(token):
     return hashlib.sha256(b"sbyg-enc:" + t).digest(), hashlib.sha256(b"sbyg-mac:" + t).digest()
 
 
+_LIBCRYPTO = None
+
+
+def _libcrypto():
+    """加载系统 libcrypto；失败时返回 None（回退到 openssl 命令）。"""
+    global _LIBCRYPTO
+    if _LIBCRYPTO is None:
+        _LIBCRYPTO = False
+        vp, cp, ip = ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)
+        for name in (os.environ.get("SB_LIBCRYPTO"), ctypes.util.find_library("crypto"), "libcrypto.so.3",
+                     "libcrypto.so.1.1", "libcrypto.so.1.0.0", "libcrypto.so"):
+            if not name:
+                continue
+            try:
+                lib = ctypes.CDLL(name)
+                lib.EVP_CIPHER_CTX_new.restype = vp
+                lib.EVP_CIPHER_CTX_free.argtypes = [vp]
+                lib.EVP_aes_256_cbc.restype = vp
+                for f in ("EVP_EncryptInit_ex", "EVP_DecryptInit_ex"):
+                    getattr(lib, f).argtypes = [vp, vp, vp, cp, cp]
+                for f in ("EVP_EncryptUpdate", "EVP_DecryptUpdate"):
+                    getattr(lib, f).argtypes = [vp, vp, ip, cp, ctypes.c_int]
+                for f in ("EVP_EncryptFinal_ex", "EVP_DecryptFinal_ex"):
+                    getattr(lib, f).argtypes = [vp, vp, ip]
+                _LIBCRYPTO = lib
+                break
+            except (OSError, AttributeError):
+                continue
+    return _LIBCRYPTO or None
+
+
+def _aes_lib(lib, data, key, iv, decrypt):
+    ctx = lib.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise ValueError("EVP_CIPHER_CTX_new failed")
+    try:
+        pre = "Decrypt" if decrypt else "Encrypt"
+        init, update, final = (getattr(lib, "EVP_%s%s" % (pre, s)) for s in ("Init_ex", "Update", "Final_ex"))
+        if init(ctx, lib.EVP_aes_256_cbc(), None, key, iv) != 1:
+            raise ValueError("aes init failed")
+        buf = ctypes.create_string_buffer(len(data) + 32)
+        n1, n2 = ctypes.c_int(0), ctypes.c_int(0)
+        if update(ctx, ctypes.addressof(buf), ctypes.byref(n1), data, len(data)) != 1:
+            raise ValueError("aes update failed")
+        if final(ctx, ctypes.addressof(buf) + n1.value, ctypes.byref(n2)) != 1:
+            raise ValueError("aes final failed (bad padding)")
+        return buf.raw[:n1.value + n2.value]
+    finally:
+        lib.EVP_CIPHER_CTX_free(ctx)
+
+
 def aes_cbc(data, key, iv, decrypt=False):
+    lib = _libcrypto()
+    if lib is not None:
+        return _aes_lib(lib, data, key, iv, decrypt)
+    # 回退：openssl 命令（密钥会出现在进程参数中，仅在找不到 libcrypto 时使用）
     cmd = ["openssl", "enc", "-aes-256-cbc", "-K", key.hex(), "-iv", iv.hex()]
     if decrypt:
         cmd.insert(2, "-d")
@@ -1536,6 +1701,7 @@ ACTIONS = {
     "trafficoff": ("manage", lambda p: set_traffic(False)),
     "trafficpurge": ("manage", purge_traffic),
     "trafficconf": ("manage", lambda p: traffic_conf(p or None)),
+    "upgrade": ("manage", do_upgrade),
 }
 PERMS = ("read", "links", "manage")
 
@@ -1547,7 +1713,7 @@ def params_rev():
         fid = _file_id(os.path.join(SB_DIR, fn))
         h.update(repr(fid[2:] if fid else None).encode())
     return h.hexdigest()[:16]
-MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog"}
+MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog", "upgrade"}
 QUIET = {"ping", "status", "logs", "stats", "peers", "rawlog", "traffic", "apilog"}  # 高频只读动作不写审计日志
 
 
@@ -1719,6 +1885,27 @@ class Handler(BaseHTTPRequestHandler):
 class Server(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    MAX_CONC = 32  # 同时处理的连接上限，超出直接关闭，防止连接洪水耗尽线程与内存
+
+    def __init__(self, *a, **k):
+        HTTPServer.__init__(self, *a, **k)
+        self._sem = threading.BoundedSemaphore(self.MAX_CONC)
+
+    def process_request(self, request, client_address):
+        if not self._sem.acquire(False):
+            self.shutdown_request(request)
+            return
+        try:
+            socketserver.ThreadingMixIn.process_request(self, request, client_address)
+        except Exception:
+            self._sem.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            socketserver.ThreadingMixIn.process_request_thread(self, request, client_address)
+        finally:
+            self._sem.release()
 
 
 class Server6(Server):
@@ -2032,6 +2219,7 @@ def main():
     p.add_argument("--perms")
     p.add_argument("--allow")
     sp.add_parser("apiuninstall")
+    sp.add_parser("upgrade", help="从仓库升级 sb.sh 与 sbagent.py")
     sp.add_parser("apiinfo")
     a = ap.parse_args()
     out = lambda o: print(json.dumps(o, ensure_ascii=False, indent=2))
@@ -2102,6 +2290,8 @@ def main():
         serve()
     elif a.cmd == "apiinstall":
         out(api_install(a.port, a.regen, a.perms, a.allow))
+    elif a.cmd == "upgrade":
+        out(do_upgrade())
     elif a.cmd == "apiuninstall":
         out(api_uninstall())
     elif a.cmd == "apiinfo":
