@@ -293,7 +293,13 @@ check(r["to"] == {"script": "v99.1", "agent": "9.9.9"} and open(A.SB_SCRIPT, "rb
 check(open(os.path.join(r["backup"], "sbagent.py"), "rb").read() == before_agent
       and open(os.path.join(r["backup"], "sb"), "rb").read() == b"#!/bin/bash\n# old\n", "previous files backed up")
 check(not r["restarting"], "no restart when not running as a service")
-check(A.ACTIONS["upgrade"][0] == "manage", "upgrade requires manage permission")
+check(A.ACTIONS["upgrade"][0] == "upgrade" and "upgrade" not in A.PERMS, "upgrade needs its own permission, not granted by default")
+check({a for a in A.ACTIONS if A.ACTIONS[a][0] == "upgrade"} == {"upgrade", "coreupgrade"}, "only script/core upgrade (the actions that run new code) need the upgrade permission")
+check(A.parse_perms("read,links,manage,upgrade") == ["read", "links", "manage", "upgrade"], "upgrade permission can be granted locally")
+try:
+    A.log_policy({"max_mb": 500, "keep": 100}); check(False, "log policy disk cap")
+except ValueError as e:
+    check("2048" in str(e), "log policy total size capped at 2GB (prevents filling the disk via API)")
 hs.shutdown()
 
 # ---------------- 7. 并发连接上限
@@ -318,5 +324,71 @@ resp = c.recv(100)
 c.close()
 check(resp.startswith(b"HTTP/1.0 404"), "server serves again after held connections close")
 srv2.shutdown()
+# ---------------- 8. 远程升级 sing-box 内核（需要可执行的假内核，仅在 Linux 上运行）
+check(A.ACTIONS["coreupgrade"][0] == "upgrade", "core upgrade needs the separate upgrade permission")
+for bad in ("../../x", "1.2.3;id", "1.2", "latest2", "http://x/1.2.3"):
+    try:
+        A.do_core_upgrade({"version": bad})
+        check(False, "core version rejected: " + bad)
+        break
+    except (ValueError, RuntimeError):
+        pass
+else:
+    check(True, "core upgrade rejects malformed versions (no URLs/paths/shell)")
+if os.name != "nt" and A.core_arch():
+    import tarfile, io as _io, http.server as _hs2
+    cpu = A.core_arch()
+    rel = {}
+
+    def fake_core(ver, check_rc=0, report=None):
+        sh = "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'sing-box version %s'; exit 0; fi\nif [ \"$1\" = check ]; then exit %d; fi\nexit 0\n" % (report or ver, check_rc)
+        buf = _io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            ti = tarfile.TarInfo("sing-box-%s-linux-%s/sing-box" % (ver, cpu))
+            ti.size, ti.mode = len(sh), 0o755
+            tf.addfile(ti, _io.BytesIO(sh.encode()))
+        rel["/v%s/sing-box-%s-linux-%s.tar.gz" % (ver, ver, cpu)] = buf.getvalue()
+
+    class _R(_hs2.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            b = rel.get(self.path)
+            self.send_response(200 if b else 404)
+            self.end_headers()
+            if b:
+                self.wfile.write(b)
+
+    rs = _hs2.HTTPServer(("127.0.0.1", 0), _R)
+    threading.Thread(target=rs.serve_forever, daemon=True).start()
+    A.CORE_RELEASE = "http://127.0.0.1:%d" % rs.server_address[1]
+    old_bin = open(A.SB_BIN, "rb").read()
+    state = {"active": True}
+    A.svc_restart = lambda n: (0, "")
+    A.svc_active = lambda n: state["active"]
+    A._sleep_active = lambda: state["active"]
+    fake_core("9.8.1", check_rc=1)
+    try:
+        A.do_core_upgrade({"version": "9.8.1"}); check(False, "incompatible core rejected")
+    except RuntimeError as e:
+        check("check" in str(e) and open(A.SB_BIN, "rb").read() == old_bin, "core failing sing-box check is rejected, binary untouched")
+    fake_core("9.8.2", report="1.0.0")
+    try:
+        A.do_core_upgrade({"version": "9.8.2"}); check(False, "version mismatch rejected")
+    except RuntimeError:
+        check(open(A.SB_BIN, "rb").read() == old_bin, "core reporting a different version is rejected")
+    fake_core("9.8.3")
+    r = A.do_core_upgrade({"version": "9.8.3"})
+    check(r["changed"] and "9.8.3" in open(A.SB_BIN).read() and os.path.exists(os.path.join(r["backup"], "sing-box"))
+          and open(os.path.join(r["backup"], "sing-box"), "rb").read() == old_bin, "core upgraded, previous binary backed up")
+    after = open(A.SB_BIN, "rb").read()
+    fake_core("9.8.4")
+    state["active"] = False
+    try:
+        A.do_core_upgrade({"version": "9.8.4"}); check(False, "unstable core rolled back")
+    except RuntimeError as e:
+        check("恢复" in str(e) and open(A.SB_BIN, "rb").read() == after, "core that does not stay running is rolled back")
+    rs.shutdown()
 shutil.rmtree(T, ignore_errors=True)
 print("FAILS:", fails); sys.exit(1 if fails else 0)

@@ -133,6 +133,25 @@ jobs:
           sudo cp sb.sh /usr/bin/sb
           sudo python3 /etc/s-box/sbagent.py apiinstall --port 18080 > /dev/null
           sleep 3; systemctl is-active sbagent
+          sudo touch /root/sbyg_update   # 跳过 sb.sh 首次运行时的依赖安装
+          # 0) 加固后的 systemd 服务中，API 正常工作；默认权限下不能升级脚本或内核
+          sudo python3 tests/api_client.py status > /dev/null
+          sudo python3 tests/api_client.py restart > /dev/null && sleep 3 && systemctl is-active sing-box
+          if sudo python3 tests/api_client.py upgrade; then echo "::error title=perm::upgrade allowed without upgrade permission"; exit 1; fi
+          if sudo python3 tests/api_client.py coreupgrade '{"version":"latest"}'; then echo "::error title=perm::coreupgrade allowed without upgrade permission"; exit 1; fi
+          # 0b) 本机授予 upgrade 后，经 API 切换到另一个真实的 sing-box 正式版，再切回最新版
+          sudo python3 /etc/s-box/sbagent.py apiset --perms read,links,manage,upgrade > /dev/null
+          sleep 4
+          cur=$(sudo /etc/s-box/sing-box version | awk '/version/{print $NF}')
+          target=$(curl -s https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box | jq -r --arg c "$cur" '[.versions[] | select(test("^1[.](1[1-9])[.][0-9]+$")) | select(. != $c)] | .[0]')
+          echo "core: $cur -> $target"
+          sudo python3 tests/api_client.py coreupgrade "{\"version\":\"$target\"}"
+          got=$(sudo /etc/s-box/sing-box version | awk '/version/{print $NF}')
+          if [[ "$got" != "$target" ]] || ! systemctl is-active --quiet sing-box; then echo "::error title=coreupgrade::core=$got want=$target"; sudo tail -n 20 /etc/s-box/sing-box.log; exit 1; fi
+          sudo python3 tests/api_client.py coreupgrade '{"version":"latest"}' > /dev/null
+          got=$(sudo /etc/s-box/sing-box version | awk '/version/{print $NF}')
+          if [[ "$got" != "$cur" ]] || ! systemctl is-active --quiet sing-box; then echo "::error title=coreupgrade::switch back failed core=$got want=$cur"; exit 1; fi
+          if sudo python3 tests/api_client.py coreupgrade '{"version":"1.2.3;id"}'; then echo "::error title=coreupgrade::malformed version accepted"; exit 1; fi
           # 1) 正常升级：替换文件，由独立的 systemd 单元重启 agent
           sudo SB_UPDATE_BASE=http://127.0.0.1:18765 python3 /etc/s-box/sbagent.py upgrade
           sleep 20

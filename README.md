@@ -70,7 +70,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 | 连接日志 | 只能用 journalctl 查看原始运行日志 | 主菜单17：每个连接的源IP、协议、访问目标、出站；按IP/目标统计；失败与主动探测记录；在线IP；日志 gzip 压缩归档、保留天数、按时间段删除 |
 | 流量统计 | 无 | 按源IP/访问地址/主域名/日期/小时/月份/协议统计；记录网卡流量 |
 | 泄露后处理 | 只能手动逐项修改 UUID、端口等 | 主菜单18：一键重置 UUID/Vmess路径/Reality密钥/订阅路径/端口，备份与校验失败自动回滚；定时重置；泄露检测 |
-| 远程管理 | 无 | 主菜单19：加密管理API（权限分级、IP白名单、防爆破、审计日志），配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 网页面板管理多台服务器，支持远程一键升级 |
+| 远程管理 | 无 | 主菜单19：加密管理API（权限分级、IP白名单、防爆破、审计日志），配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 网页面板管理多台服务器，支持远程一键升级脚本与 sing-box 内核（需单独授权） |
 | 安装：端口 | 随机，或逐个协议输入 | 另可按顺序一次输入全部端口（空格分隔），逐项校验格式、占用与重复 |
 | 安装：结束输出 | 逐个协议显示链接与二维码，每项停顿2秒 | 统一列出全部节点链接、聚合节点、API信息；二维码在主菜单9查看 |
 | 安装：API | 无 | 第零步可选开启API |
@@ -93,7 +93,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 
 #### 一键安装流程
 1. 是否开放端口、关闭防火墙（回车默认执行）
-2. **零、是否开启API管理**（回车默认不开启）：开启时设置API端口、权限级别（完全管理 / 只读+节点链接 / 仅只读）、可选IP白名单、是否开启流量统计；Sing-box 安装完成后自动启用，若与协议端口冲突会自动换端口
+2. **零、是否开启API管理**（回车默认不开启）：开启时设置API端口、权限级别（完全管理 / 只读+节点链接 / 仅只读）、是否允许面板远程升级（默认否）、可选IP白名单、是否开启流量统计；Sing-box 安装完成后自动启用，若与协议端口冲突会自动换端口
 3. 一、选择内核版本；二、证书（自签 / Acme域名证书）
 4. **三、协议端口**：
    * 1：全部随机（回车默认）
@@ -109,8 +109,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 
 #### 安全
 * API 通信 AES-256 加密 + HMAC 签名，防重放；未通过校验的请求一律返回 404
-* **权限、IP白名单、Token 只能在 VPS 上修改**，API 中没有修改它们或执行命令的接口，Token 泄露也无法控制 VPS；认证失败10次封禁1小时；两次重置的最小间隔；审计日志
+* **权限、IP白名单、Token 只能在 VPS 上修改**，API 中没有修改它们或执行命令的接口，Token 泄露也无法控制 VPS；唯一会让服务器运行新代码的「远程升级」（脚本、sing-box 内核）是单独的权限，默认关闭，且只从本仓库与 SagerNet 官方发布下载；认证失败10次封禁1小时；两次重置的最小间隔；审计日志
 * 流量统计使用 sing-box 自带的 Clash API，只监听 127.0.0.1 并使用随机密钥；`/etc/s-box`（含私钥、Token）权限为 700
+* 威胁模型、各权限能做什么与审计结论见 [SECURITY.md](SECURITY.md)
 
 #### 命令行（`/etc/s-box/sbagent.py`）
 ```
@@ -121,6 +122,7 @@ python3 /etc/s-box/sbagent.py reset all                         # 一键重置(U
 python3 /etc/s-box/sbagent.py reset full                        # 同上并重置端口
 python3 /etc/s-box/sbagent.py logprune --days 30                # 删除30天以前的日志
 python3 /etc/s-box/sbagent.py apiset --perms read,links          # 修改API权限（仅本机）
+python3 /etc/s-box/sbagent.py coreupgrade 1.12.10               # 切换 sing-box 内核（不填版本为最新正式版）
 ```
 
 * 详细变更见 [CHANGELOG.md](CHANGELOG.md)

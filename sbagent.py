@@ -37,7 +37,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
@@ -601,6 +601,8 @@ def log_policy(p=None):
         pol["retain_days"] = int(pol["retain_days"])
         if not (1 <= pol["max_mb"] <= 500 and 0 <= pol["keep"] <= 100 and 0 <= pol["retain_days"] <= 3650):
             raise ValueError("单文件上限需 1~500MB，归档份数 0~100，保留天数 0~3650")
+        if pol["max_mb"] * (pol["keep"] + 1) > 2048:
+            raise ValueError("日志总量（单文件上限 ×（归档份数+1））不能超过 2048MB，防止占满磁盘")
         write(LOG_POLICY_CONF, json.dumps(pol))
         rotate()
     return pol
@@ -1521,6 +1523,131 @@ def do_upgrade(p=None):
         UPGRADE_LOCK.release()
 
 
+# ---------------------------------------------------------------- 远程升级 sing-box 内核
+# 只从 SagerNet 官方 GitHub Releases（HTTPS，校验证书）下载；参数只接受严格格式的版本号，不接受下载地址。
+# 新内核需能运行并报告相同版本、并通过本机配置的 sing-box check，才会替换；替换前备份内核与 sb.json，
+# 重启后 sing-box 不能稳定运行则恢复旧内核与配置。
+CORE_RELEASE = os.environ.get("SB_CORE_RELEASE", "https://github.com/SagerNet/sing-box/releases/download")
+CORE_VERSION_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}(-(alpha|beta|rc)\.\d{1,3})?$")
+CORE_LOCK = threading.Lock()
+
+
+def core_arch():
+    m = os.uname().machine if hasattr(os, "uname") else ""
+    return {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "armv7"}.get(m)
+
+
+def ver_key(v):
+    main, _, pre = v.partition("-")
+    nums = [int(x) for x in main.split(".")]
+    if not pre:
+        return nums + [1, 0]
+    kind, _, n = pre.partition(".")
+    return nums + [0, {"alpha": 0, "beta": 1, "rc": 2}.get(kind, 0) * 1000 + int(n or 0)]
+
+
+def core_versions():
+    """最新正式版与测试版（jsDelivr 优先，避免 GitHub API 频率限制）。"""
+    vers = []
+    try:
+        vers = json.loads(http_get("https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box", 2 * 1024 * 1024)).get("versions", [])
+    except Exception:
+        pass
+    if not vers:
+        rels = json.loads(http_get("https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30", 4 * 1024 * 1024))
+        vers = [r.get("tag_name", "").lstrip("v") for r in rels]
+    vers = sorted({v for v in vers if CORE_VERSION_RE.match(v)}, key=ver_key, reverse=True)
+    stable = [v for v in vers if "-" not in v]
+    return {"latest": stable[0] if stable else "", "prerelease": vers[0] if vers and "-" in vers[0] else ""}
+
+
+def _core_installed():
+    v = sb_version()
+    return v.splitlines()[0].replace("sing-box version ", "").strip() if v else ""
+
+
+def do_core_upgrade(p=None):
+    p = p or {}
+    want = str(p.get("version") or "latest").strip()
+    if want in ("latest", "prerelease"):
+        want = core_versions().get(want) or ""
+    if not CORE_VERSION_RE.match(want):
+        raise ValueError("内核版本格式错误：%s（例：1.12.10 或 1.13.0-rc.1）" % want)
+    cpu = core_arch()
+    if not cpu:
+        raise RuntimeError("不支持的 CPU 架构，无法自动升级内核")
+    if not CORE_LOCK.acquire(False):
+        raise RuntimeError("已有内核升级正在进行")
+    try:
+        old = _core_installed()
+        if old == want and not p.get("force"):
+            return {"from": old, "to": want, "changed": False, "active": svc_active("sing-box")}
+        name = "sing-box-%s-linux-%s" % (want, cpu)
+        data = http_get("%s/v%s/%s.tar.gz" % (CORE_RELEASE, want, name), 80 * 1024 * 1024)
+        import tarfile
+        import io as _io
+        with tarfile.open(fileobj=_io.BytesIO(data), mode="r:gz") as tf:
+            member = tf.getmember(name + "/sing-box")  # 只读取这一个文件，不解压其它内容
+            if not member.isfile():
+                raise RuntimeError("压缩包内容异常")
+            binary = tf.extractfile(member).read()
+        new_bin = SB_BIN + ".new"
+        with open(new_bin, "wb") as f:
+            f.write(binary)
+        os.chmod(new_bin, 0o755)
+        try:
+            rc, out = runs([new_bin, "version"])
+            if rc != 0 or want not in out:
+                raise RuntimeError("新内核无法运行或版本不符：" + out[:200])
+            num = "10" if want.startswith("1.10.") else "11"
+            cfg = os.path.join(SB_DIR, "sb%s.json" % num)
+            rc, out = runs([new_bin, "check", "-c", cfg])
+            if rc != 0:
+                raise RuntimeError("新内核不兼容当前配置（sing-box check 失败），未做任何改动：" + out[:300])
+            bdir = os.path.join(SB_DIR, "backup", "core-" + time.strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(bdir, exist_ok=True)
+            shutil.copy2(SB_BIN, os.path.join(bdir, "sing-box"))
+            shutil.copy2(os.path.join(SB_DIR, "sb.json"), os.path.join(bdir, "sb.json"))
+            _keep_backups(os.path.join(SB_DIR, "backup"), 10)
+            os.replace(new_bin, SB_BIN)
+        finally:
+            if os.path.exists(new_bin):
+                os.remove(new_bin)
+        shutil.copyfile(cfg, os.path.join(SB_DIR, "sb.json"))
+        if num == "10" and not os.path.exists("/root/geosite.db"):
+            # 1.10 内核的 geosite 分流需要规则库（与 sb.sh 一致）
+            for f in ("geoip.db", "geosite.db"):
+                try:
+                    write_bytes("/root/" + f, http_get("https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/" + f, 64 * 1024 * 1024))
+                except Exception:
+                    pass
+        svc_restart("sing-box")
+        ok = all(_sleep_active() for _ in range(3))
+        if not ok:
+            shutil.copy2(os.path.join(bdir, "sing-box"), SB_BIN)
+            shutil.copy2(os.path.join(bdir, "sb.json"), os.path.join(SB_DIR, "sb.json"))
+            svc_restart("sing-box")
+            raise RuntimeError("新内核 %s 启动后未能稳定运行，已恢复为 %s" % (want, old))
+        share_cmd = os.environ.get("SB_SHARE_CMD")
+        if share_cmd or os.path.exists(SB_CMD):  # 1.10 与新内核的协议不同（Anytls），重新生成分享链接
+            runs(share_cmd or "cd /root && bash %s --share >/dev/null 2>&1" % SB_CMD, timeout=240, shell=True)
+        return {"from": old, "to": _core_installed(), "changed": True, "active": svc_active("sing-box"), "backup": bdir}
+    finally:
+        CORE_LOCK.release()
+
+
+def _sleep_active():
+    time.sleep(2)
+    return svc_active("sing-box")
+
+
+def write_bytes(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------- 状态
 _VER_CACHE = {}
 
@@ -1674,7 +1801,8 @@ def unseal(env, keys):
     return json.loads(pt.decode())
 
 
-# 动作 -> (所需权限, 处理函数)。权限：read 只读查看；links 查看节点/订阅链接；manage 修改与重置。
+# 动作 -> (所需权限, 处理函数)。权限：read 只读查看；links 查看节点/订阅链接；manage 修改与重置；
+# upgrade 远程升级脚本/sing-box 内核（仅有的会运行新代码的动作，代码只来自内置仓库地址与 SagerNet 官方发布，需在 VPS 上单独开启）。
 # 注意：没有任何动作可以执行任意命令、修改 API 权限/白名单/Token，这些只能在 VPS 上通过 sb 菜单修改，
 # 即使 Token 泄露，对方也无法借此控制 VPS 或提升权限。
 ACTIONS = {
@@ -1701,9 +1829,13 @@ ACTIONS = {
     "trafficoff": ("manage", lambda p: set_traffic(False)),
     "trafficpurge": ("manage", purge_traffic),
     "trafficconf": ("manage", lambda p: traffic_conf(p or None)),
-    "upgrade": ("manage", do_upgrade),
+    "upgrade": ("upgrade", do_upgrade),
+    "coreupgrade": ("upgrade", do_core_upgrade),
+    "coreversions": ("read", lambda p: core_versions()),
 }
 PERMS = ("read", "links", "manage")
+# upgrade（远程升级，会从仓库下载并运行新代码）必须单独授予，不包含在默认权限中
+ALL_PERMS = PERMS + ("upgrade",)
 
 
 def params_rev():
@@ -1713,7 +1845,7 @@ def params_rev():
         fid = _file_id(os.path.join(SB_DIR, fn))
         h.update(repr(fid[2:] if fid else None).encode())
     return h.hexdigest()[:16]
-MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog", "upgrade"}
+MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog", "upgrade", "coreupgrade"}
 QUIET = {"ping", "status", "logs", "stats", "peers", "rawlog", "traffic", "apilog"}  # 高频只读动作不写审计日志
 
 
@@ -1936,6 +2068,10 @@ def serve():
     if not conf or not conf.get("token"):
         sys.exit("未初始化API，请先执行：sbagent.py apiinit")
     global LOG_INDEX, COLLECTOR
+    try:
+        os.chmod(SB_DIR, 0o700)  # 目录内有 Reality 私钥、API Token 等，禁止其他本地用户读取
+    except OSError:
+        pass
     LOG_INDEX = LogIndex()
     if sqlite3 is not None:
         COLLECTOR = TrafficCollector()
@@ -1964,12 +2100,12 @@ def serve():
 # ---------------------------------------------------------------- API 服务安装
 def parse_perms(v):
     perms = [x.strip() for x in (v.split(",") if isinstance(v, str) else v) if x.strip()]
-    bad = [x for x in perms if x not in PERMS]
+    bad = [x for x in perms if x not in ALL_PERMS]
     if bad or not perms:
-        raise ValueError("权限只能是 read,links,manage 的组合（至少 read）")
+        raise ValueError("权限只能是 read,links,manage,upgrade 的组合（至少 read）")
     if "read" not in perms:
         perms.insert(0, "read")
-    return [x for x in PERMS if x in perms]
+    return [x for x in ALL_PERMS if x in perms]
 
 
 def parse_allow(v):
@@ -2046,7 +2182,9 @@ def api_install(port=None, regen=False, perms=None, allow=None):
     else:
         write("/etc/systemd/system/sbagent.service", "[Unit]\nDescription=sing-box-yg api agent\n"
               "After=network.target\n[Service]\nUser=root\nWorkingDirectory=/root\n"
-              "ExecStart=%s %s serve\nRestart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n"
+              "ExecStart=%s %s serve\nRestart=always\nRestartSec=5\nUMask=0077\nNoNewPrivileges=yes\nPrivateTmp=yes\n"
+              "RestrictSUIDSGID=yes\nLockPersonality=yes\nRestrictRealtime=yes\nProtectClock=yes\nProtectHostname=yes\n"
+              "[Install]\nWantedBy=multi-user.target\n"
               % (py, me))
         runs(["systemctl", "daemon-reload"])
         runs(["systemctl", "enable", "sbagent"])
@@ -2220,6 +2358,8 @@ def main():
     p.add_argument("--allow")
     sp.add_parser("apiuninstall")
     sp.add_parser("upgrade", help="从仓库升级 sb.sh 与 sbagent.py")
+    p = sp.add_parser("coreupgrade", help="升级/切换 sing-box 内核：latest | prerelease | 版本号")
+    p.add_argument("version", nargs="?", default="latest")
     sp.add_parser("apiinfo")
     a = ap.parse_args()
     out = lambda o: print(json.dumps(o, ensure_ascii=False, indent=2))
@@ -2292,6 +2432,8 @@ def main():
         out(api_install(a.port, a.regen, a.perms, a.allow))
     elif a.cmd == "upgrade":
         out(do_upgrade())
+    elif a.cmd == "coreupgrade":
+        out(do_core_upgrade({"version": a.version}))
     elif a.cmd == "apiuninstall":
         out(api_uninstall())
     elif a.cmd == "apiinfo":

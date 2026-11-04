@@ -1,5 +1,28 @@
 # 变更日志
 
+## v26.11.9（2026-11-04）
+
+### 新增（sbagent 1.4.0）
+- **远程升级 sing-box 内核**：新增 `coreupgrade` 动作与命令 `sbagent.py coreupgrade [版本]`，支持最新正式版、最新测试版或指定版本；`coreversions` 查询可用版本
+  - 只从 SagerNet 官方 GitHub Releases 下载（HTTPS），API 只接受严格格式的版本号，不接受地址
+  - 压缩包只读取 `sing-box-<版本>-linux-<架构>/sing-box` 这一个文件；新内核必须能运行、报告的版本与请求一致，并通过当前配置的 `sing-box check` 才替换
+  - 替换前备份内核与配置，重启后 sing-box 不能连续稳定运行即恢复旧内核；完成后重新生成分享链接
+
+### 安全审计与修复
+结论：默认权限下，持有 API Token 也无法在服务器上执行命令、读写任意文件、修改 API 权限/白名单/Token 或安装代码。详见 [SECURITY.md](SECURITY.md)。
+
+| 级别 | 问题 | 处理 |
+|---|---|---|
+| 中 | 远程升级（会让服务器运行新代码的唯一操作）只需 `manage` 权限，Token 泄露即可触发 | 新增独立的 `upgrade` 权限，默认不授予；安装与 19→6 中单独询问 |
+| 低（原版遗留） | crontab 修改使用固定路径 `/tmp/crontab.tmp`，本地用户可预先创建符号链接篡改 root 的 crontab | 改为 `mktemp` 随机文件，退出时删除 |
+| 低 | 日志策略可设置到约 50GB，可被用来占满磁盘 | 单文件大小 ×（保留数+1）上限 2GB |
+| 低（原版遗留） | 已有安装的 `/etc/s-box` 为 755 | sbagent 启动时修正为 700 |
+| 加固 | sbagent systemd 单元 | `UMask=0077 NoNewPrivileges PrivateTmp RestrictSUIDSGID LockPersonality RestrictRealtime ProtectClock ProtectHostname` |
+
+### 测试
+- 单元测试：脚本与内核升级都需要 `upgrade` 权限；畸形版本号在所有入口被拒绝；内核 check 失败、版本不符时不替换，成功时备份，运行失败时回滚；日志上限
+- CI：在加固后的真实 systemd 服务中经加密 API 调用；确认默认权限下升级被拒绝；授予后经 API 把真实 sing-box 切换到另一个正式版再切回最新版并确认运行；畸形版本被拒绝
+
 ## v26.11.8（2026-11-04）
 
 ### 新增（sbagent 1.3.0）

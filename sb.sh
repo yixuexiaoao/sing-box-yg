@@ -1,5 +1,8 @@
 #!/bin/bash
 export LANG=en_US.UTF-8
+# 修改 crontab 用的临时文件：随机文件名，避免固定路径 /tmp/crontab.tmp 被本地用户预先放置符号链接
+sbcron=$(mktemp /tmp/sbcron.XXXXXXXX 2>/dev/null || mktemp)
+trap 'rm -f "$sbcron"' EXIT
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -2590,21 +2593,21 @@ EOF
 chmod +x /etc/local.d/alpineargo.start
 rc-update add local default >/dev/null 2>&1
 else
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/url http/d' /tmp/crontab.tmp
-echo '@reboot sleep 10 && /bin/bash -c "nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10 && printf \"9\n1\n\" | bash /usr/bin/sb > /dev/null 2>&1"' >> /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/url http/d' "$sbcron"
+echo '@reboot sleep 10 && /bin/bash -c "nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10 && printf \"9\n1\n\" | bash /usr/bin/sb > /dev/null 2>&1"' >> "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 fi
 else
 yellow "Argo临时域名验证暂不可用，请稍后再试"
 fi
 elif [ "$menu" = "2" ]; then
 ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/url http/d' /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/url http/d' "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 rm -rf /etc/s-box/vm_ws_argols.txt
 ps -ef 2>/dev/null | grep -q '[c]loudflared.*run' || rm -rf /etc/s-box/cloudflared
 rm -rf /etc/local.d/alpineargo.start
@@ -3276,10 +3279,10 @@ elif [ "$menu" = "3" ];then
 subportipsub
 elif [ "$menu" = "4" ];then
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/websbox/d' /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/websbox/d' "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 rm -rf /root/websbox
 rm -rf /etc/local.d/alpinesub.start
 green "本地IP订阅链接已卸载完成" && sleep 3 && exit
@@ -3308,11 +3311,11 @@ EOF
 chmod +x /etc/local.d/alpinesub.start
 rc-update add local default >/dev/null 2>&1
 else
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/websbox/d' /tmp/crontab.tmp
-echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat /etc/s-box/subport.log 2>/dev/null) -h /root/websbox > /dev/null 2>&1 &"' >> /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/websbox/d' "$sbcron"
+echo '@reboot sleep 10 && /bin/bash -c "busybox httpd -f -p $(cat /etc/s-box/subport.log 2>/dev/null) -h /root/websbox > /dev/null 2>&1 &"' >> "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 fi
 sbshare > /dev/null 2>&1
 sleep 1 && green "本地IP订阅链接已更新完成" && sleep 3 && sb
@@ -3956,21 +3959,21 @@ fi
 
 cronsb(){
 uncronsb
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-echo "0 1 * * * systemctl restart sing-box;rc-service sing-box restart" >> /tmp/crontab.tmp
-echo '*/10 * * * * f=/etc/s-box/sing-box.log; [ -f $f ] && [ $(wc -c < $f) -gt 10485760 ] && cp -f $f $f.1 && : > $f' >> /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+echo "0 1 * * * systemctl restart sing-box;rc-service sing-box restart" >> "$sbcron"
+echo '*/10 * * * * f=/etc/s-box/sing-box.log; [ -f $f ] && [ $(wc -c < $f) -gt 10485760 ] && cp -f $f $f.1 && : > $f' >> "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 }
 uncronsb(){
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/sing-box/d' /tmp/crontab.tmp
-sed -i '/sbwpph/d' /tmp/crontab.tmp
-sed -i '/url http/d' /tmp/crontab.tmp
-sed -i '/websbox/d' /tmp/crontab.tmp
-sed -i '/sbagent/d' /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/sing-box/d' "$sbcron"
+sed -i '/sbwpph/d' "$sbcron"
+sed -i '/url http/d' "$sbcron"
+sed -i '/websbox/d' "$sbcron"
+sed -i '/sbagent/d' "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 }
 
 lnsb(){
@@ -4362,10 +4365,10 @@ restartsb
 uninswpph(){
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 rm -rf /etc/s-box/sbwpph.log
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/sbwpph/d' /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/sbwpph/d' "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 rm -rf /etc/local.d/alpinews5.start
 }
 aplws5(){
@@ -4378,11 +4381,11 @@ EOF
 chmod +x /etc/local.d/alpinews5.start
 rc-update add local default >/dev/null 2>&1
 else
-crontab -l 2>/dev/null > /tmp/crontab.tmp
-sed -i '/sbwpph/d' /tmp/crontab.tmp
-echo '@reboot sleep 10 && /bin/bash -c "nohup $(cat /etc/s-box/sbwpph.log 2>/dev/null) &"' >> /tmp/crontab.tmp
-crontab /tmp/crontab.tmp >/dev/null 2>&1
-rm /tmp/crontab.tmp
+crontab -l 2>/dev/null > "$sbcron"
+sed -i '/sbwpph/d' "$sbcron"
+echo '@reboot sleep 10 && /bin/bash -c "nohup $(cat /etc/s-box/sbwpph.log 2>/dev/null) &"' >> "$sbcron"
+crontab "$sbcron" >/dev/null 2>&1
+: > "$sbcron"
 fi
 }
 echo
@@ -4676,6 +4679,9 @@ case "$sel" in
 3 ) apiperms=read;;
 * ) apiperms=read,links,manage;;
 esac
+yellow "是否允许在面板中远程升级本脚本与 sing-box 内核？(会从 GitHub 下载并运行新版本，仅「完全管理」时可用)"
+readp "1、不允许 (回车默认，更安全)  2、允许：" sel
+[[ "$sel" = "2" && "$apiperms" = "read,links,manage" ]] && apiperms=read,links,manage,upgrade
 echo
 yellow "可选：只允许指定IP/网段访问API，多个用逗号分隔 (回车不限制)"
 yellow "注意：Cloudflare Worker 的出口IP不固定，填写后Worker面板可能无法连接，一般请直接回车"
@@ -4740,10 +4746,12 @@ apiport=$(shuf -i 10000-65535 -n 1)
 fi
 $sbag apiinstall --port "$apiport" >/dev/null && green "API端口已更换" && sbapishow;;
 5 ) $sbag apiuninstall >/dev/null && green "API服务已卸载";;
-6 ) yellow "1：完全管理  2：只读 + 查看节点链接  3：仅只读"
-readp "请选择【1-3】：" sel
+6 ) yellow "1：完全管理  2：只读 + 查看节点链接  3：仅只读  4：完全管理 + 允许面板远程升级脚本与 sing-box 内核"
+yellow "说明：只有选项4允许通过API安装新代码（只从本仓库与 SagerNet 官方发布下载，面板不能指定地址），其余权限都无法在VPS上执行任何命令"
+readp "请选择【1-4】：" sel
 case "$sel" in
 1 ) $sbag apiset --perms read,links,manage >/dev/null && green "已设置为完全管理";;
+4 ) $sbag apiset --perms read,links,manage,upgrade >/dev/null && green "已设置为完全管理 + 允许远程升级";;
 2 ) $sbag apiset --perms read,links >/dev/null && green "已设置为只读 + 查看节点链接";;
 3 ) $sbag apiset --perms read >/dev/null && green "已设置为仅只读";;
 esac;;
@@ -4770,7 +4778,7 @@ fi
 echo
 green "对接信息如下 (整段JSON粘贴到Worker面板「添加服务器」即可)："
 blue "$($sbag apiinfo | python3 -c 'import json,sys;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ("name","host","port","path","token")},ensure_ascii=False))')"
-blue "API权限：$($sbag apiinfo | python3 -c 'import json,sys;m={"read":"只读","links":"节点链接","manage":"管理"};print("、".join(m[x] for x in json.load(sys.stdin)["perms"]))')"
+blue "API权限：$($sbag apiinfo | python3 -c 'import json,sys;m={"read":"只读","links":"节点链接","manage":"管理","upgrade":"远程升级"};print("、".join(m.get(x,x) for x in json.load(sys.stdin)["perms"]))')"
 echo
 yellow "1、请确保VPS后台防火墙已开放该TCP端口：$(python3 -c 'import json;print(json.load(open("/etc/s-box/sbapi.json"))["port"])')"
 yellow "2、Token等同于服务器管理权限，切勿泄露；如已泄露请选择3更换"
