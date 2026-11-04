@@ -3843,11 +3843,22 @@ lnsb(){
 rm -rf /usr/bin/sb
 curl -L -o /usr/bin/sb -# --retry 2 --insecure ${sbrepo}/sb.sh
 chmod +x /usr/bin/sb
-if [[ -d /etc/s-box ]]; then
+local rc=$?
+sbagentup
+# 返回 sb.sh 下载结果；调用方用 lnsb && ... 继续执行后续安装步骤
+return $rc
+}
+
+sbagentup(){
+[[ -d /etc/s-box ]] || return 0
 curl -sL -o /etc/s-box/sbagent.py.tmp --retry 2 ${sbrepo}/sbagent.py && grep -q 'sbagent' /etc/s-box/sbagent.py.tmp && mv -f /etc/s-box/sbagent.py.tmp /etc/s-box/sbagent.py
 rm -f /etc/s-box/sbagent.py.tmp
-if command -v apk >/dev/null 2>&1; then rc-service sbagent status >/dev/null 2>&1 && rc-service sbagent restart >/dev/null 2>&1; else systemctl is-active sbagent >/dev/null 2>&1 && systemctl restart sbagent >/dev/null 2>&1; fi
+if command -v apk >/dev/null 2>&1; then
+if rc-service sbagent status >/dev/null 2>&1; then rc-service sbagent restart >/dev/null 2>&1; fi
+else
+if systemctl is-active sbagent >/dev/null 2>&1; then systemctl restart sbagent >/dev/null 2>&1; fi
 fi
+return 0
 }
 
 upsbyg(){

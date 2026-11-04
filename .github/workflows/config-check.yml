@@ -1,0 +1,92 @@
+# 用 sb.sh 中的配置模板生成服务端配置，并在真实的 sing-box 内核上校验与试运行
+# 防止 sing-box 新版本移除/变更字段后，一键安装出现“Sing-box服务未运行”
+name: Config check
+
+on:
+  push:
+    paths:
+      - sb.sh
+      - sbagent.py
+      - .github/workflows/config-check.yml
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'   # 每周检查一次最新内核
+
+jobs:
+  singbox:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        core: [latest, prerelease, '1.10.7']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sing-box
+        id: dl
+        run: |
+          case "${{ matrix.core }}" in
+            latest) v=$(curl -sL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/^v//') ;;
+            prerelease) v=$(curl -sL "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=20" | jq -r '[.[]|select(.prerelease)][0].tag_name' | sed 's/^v//') ;;
+            *) v="${{ matrix.core }}" ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          curl -sL -o sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v$v/sing-box-$v-linux-amd64.tar.gz"
+          tar xzf sb.tgz && mv "sing-box-$v-linux-amd64/sing-box" ./sing-box-bin
+          ./sing-box-bin version
+
+      - name: Render configs from sb.sh templates
+        run: |
+          D="$PWD/sbox"; mkdir -p "$D"
+          awk '/^inssbjsonser\(\)\{/,/^sbservice\(\)\{/' sb.sh | sed '$d' | sed "s#/etc/s-box#$D#g" > render.sh
+          B=./sing-box-bin
+          kp=$($B generate reality-keypair)
+          wg=$($B generate wg-keypair)
+          openssl ecparam -genkey -name prime256v1 -out "$D/private.key"
+          openssl req -new -x509 -days 36500 -key "$D/private.key" -out "$D/cert.pem" -subj "/CN=www.bing.com"
+          cat >> render.sh <<EOF
+          uuid=$($B generate uuid)
+          port_vl_re=20001; port_vm_ws=8080; port_hy2=20003; port_tu=20004; port_an=20005
+          ym_vl_re=apple.com; ym_vm_ws=www.bing.com; tlsyn=false
+          private_key=$(echo "$kp" | awk '/PrivateKey/{print $2}' | tr -d '"'); short_id=$($B generate rand --hex 4)
+          for x in vmess_ws hy2 tuic an; do eval certificatec_\$x="$D/cert.pem"; eval certificatep_\$x="$D/private.key"; done
+          ipv=prefer_ipv4; endip=162.159.192.1; v6=2606:4700:110:8a36:df92:102a:9602:fa18
+          pvk=$(echo "$wg" | awk '/PrivateKey/{print $2}' | tr -d '"'); res=[0,0,0]
+          sbnh=$($B version | awk '/version/{print $NF}' | cut -d '.' -f 1,2)
+          inssbjsonser
+          EOF
+          bash render.sh
+          ls -la "$D"
+
+      - name: sing-box check
+        run: |
+          D="$PWD/sbox"
+          [[ "${{ matrix.core }}" == "1.10.7" ]] && f=sb10.json || f=sb11.json
+          if ! out=$(./sing-box-bin check -c "$D/$f" 2>&1); then
+            echo "::error title=sing-box ${{ steps.dl.outputs.version }} check failed ($f)::$(echo "$out" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "$out"
+
+      - name: sing-box run (5s)
+        run: |
+          D="$PWD/sbox"
+          [[ "${{ matrix.core }}" == "1.10.7" ]] && f=sb10.json || f=sb11.json
+          set +e
+          sudo timeout 5 ./sing-box-bin run -c "$D/$f" > run.out 2>&1
+          rc=$?
+          set -e
+          cat run.out; sudo cat "$D/sing-box.log" 2>/dev/null | tail -20 || true
+          if [[ $rc -ne 124 ]]; then
+            echo "::error title=sing-box ${{ steps.dl.outputs.version }} exited early (rc=$rc, $f)::$( (cat run.out; sudo tail -5 "$D/sing-box.log" 2>/dev/null) | tr '\n' ' ' | cut -c1-900)"
+            exit 1
+          fi
+
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sbagent syntax (python 3)
+        run: python3 -m py_compile sbagent.py && python3 sbagent.py --help > /dev/null
+      - name: shell syntax
+        run: for f in sb.sh kp.sh serv00.sh serv00keep.sh; do bash -n "$f"; done
