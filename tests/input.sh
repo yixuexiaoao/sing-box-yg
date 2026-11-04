@@ -1,7 +1,7 @@
 #!/bin/bash
 # 输入清洗与端口校验测试：从 sb.sh 提取真实函数运行（bash tests/input.sh）
 cd "$(dirname "$0")/.." || exit 1
-source <(sed -n '/^yellow(){/p;/^blue(){/p;/^red(){/p;/^readp(){/p' sb.sh; sed -n '/^sbclean(){/,/^}/p;/^sbportok(){/,/^}/p;/^sbportbusy(){/,/^}/p;/^chooseport(){/,/^}/p;/^sbportsline(){/,/^}/p' sb.sh)
+source <(sed -n '/^yellow(){/p;/^blue(){/p;/^red(){/p;/^green(){/p;/^readp(){/p' sb.sh; sed -n '/^sbclean(){/,/^}/p;/^sbportok(){/,/^}/p;/^sbportbusy(){/,/^}/p;/^chooseport(){/,/^}/p;/^sbportsline(){/,/^}/p;/^sbfwkind(){/,/^}/p;/^sbfwopen(){/,/^}/p;/^sbfwask(){/,/^}/p;/^sbrandport(){/,/^}/p;/^sbinsports(){/,/^}/p' sb.sh)
 export LANG=en_US.UTF-8
 sleep(){ :; }
 ss(){ printf 'udp UNCONN 0 0 0.0.0.0:20001 0.0.0.0:* users:(("x"))\n'; }
@@ -49,4 +49,46 @@ d=$(mktemp -d); printf 'echo MAIN; exit 0\n' > "$d/main.sh"
 out=$(timeout 10 bash "$d/sub.sh" 2>&1 | tr '\n' ' ')
 t "back to main menu replaces process (0 exits)" "$out" "SUB MAIN "
 rm -rf "$d"
+
+# ---- 端口输入：提示需要几个端口、少填随机、确认/重新输入、API端口保留
+sbnh=1.12
+out=$(sbportsline 2>&1 <<< "30001 8080")
+t "ports line: tells how many ports are needed" "$(echo "$out" | grep -c '请输入 5 个端口，按以下顺序')" "1"
+t "ports line: lists protocols in order with TCP/UDP" "$(echo "$out" | grep -cE '^  [1-5]\. (Vless-reality|Vmess-ws|Anytls) \[TCP\]|^  [1-5]\. (Hysteria2|Tuic5) \[UDP\]')" "5"
+t "ports line: fewer ports -> says how many were randomized" "$(echo "$out" | grep -c '只输入了 2 个端口，其余 3 个已随机生成')" "1"
+t "ports line: randomized ones are marked" "$(echo "$out" | grep -c '（随机）')" "3"
+sbportsline > /dev/null 2>&1 <<< $'30001 8080 30003 30004 30005\nr\n31001 8081 31003 31004 31005\n'
+t "ports line: 'r' re-enters, second input used" "$port_vl_re $port_vm_ws $port_an" "31001 8081 31005"
+SBRESERVED=30001
+out=$(sbportsline 2>&1 <<< $'30001 8080 30003 30004 30005\n31001 8080 30003 30004 30005')
+t "ports line: port reserved for API is rejected" "$(echo "$out" | grep -c '已被占用或已分配给API')" "1"
+port=30001; chooseport <<< "30002" > /dev/null 2>&1
+t "single port: reserved port re-prompted" "$port" "30002"
+SBRESERVED=
+sbnh=1.10
+out=$(sbportsline 2>&1 <<< "1 2 3 4")
+t "ports line: 1.10 core asks for 4 ports" "$(echo "$out" | grep -c '请输入 4 个端口，按以下顺序')" "1"
+
+# ---- 放行防火墙：按当前生效的防火墙添加放行规则，不改动其它规则
+fwl=$(mktemp)
+ufw(){ [[ $1 == status ]] && { [[ $FW == ufw ]] && echo "Status: active" || echo "Status: inactive"; return 0; }; echo "ufw $*" >> "$fwl"; }
+firewall-cmd(){ [[ $1 == --state ]] && { [[ $FW == firewalld ]]; return; }; echo "firewall-cmd $*" >> "$fwl"; }
+iptables(){ case "$*" in "-S INPUT") [[ $FW == iptables ]] && echo "-P INPUT DROP" || echo "-P INPUT ACCEPT";; -C*) return 1;; *) echo "iptables $*" >> "$fwl";; esac; }
+ip6tables(){ case "$*" in "-S INPUT") echo "-P INPUT ACCEPT";; -C*) return 1;; *) echo "ip6tables $*" >> "$fwl";; esac; }
+netfilter-persistent(){ :; }; service(){ :; }
+FW=ufw; : > "$fwl"; sbfwopen tcp/443 udp/20003
+t "firewall: ufw allow per port/proto" "$(tr '\n' ';' < "$fwl")" "ufw allow 443/tcp;ufw allow 20003/udp;"
+FW=firewalld; : > "$fwl"; sbfwopen tcp/443
+t "firewall: firewalld permanent + reload" "$(tr '\n' ';' < "$fwl")" "firewall-cmd --permanent --add-port=443/tcp;firewall-cmd --reload;"
+FW=iptables; : > "$fwl"; sbfwopen udp/20003
+t "firewall: iptables/ip6tables insert ACCEPT (v4+v6)" "$(tr '\n' ';' < "$fwl")" "iptables -I INPUT -p udp --dport 20003 -j ACCEPT;ip6tables -I INPUT -p udp --dport 20003 -j ACCEPT;"
+FW=none; : > "$fwl"; out=$(sbfwask tcp/443 udp/20003 2>&1)
+t "firewall: nothing blocking -> no rules, says so, reminds security group" "$(wc -c < "$fwl")|$(echo "$out" | grep -c '无需放行')|$(echo "$out" | grep -c '安全组.*TCP 443  UDP 20003')" "0|1|1"
+FW=ufw; : > "$fwl"; out=$(sbfwask tcp/443 <<< "2" 2>&1)
+t "firewall: user can decline" "$(wc -c < "$fwl")" "0"
+FW=ufw; : > "$fwl"; sbfwask tcp/443 <<< "" > /dev/null 2>&1
+t "firewall: Enter = open" "$(tr '\n' ';' < "$fwl")" "ufw allow 443/tcp;"
+sbnh=1.12; sbapi_on=1; apiport=40000; port_vl_re=1; port_vm_ws=2; port_hy2=3; port_tu=4; port_an=5
+t "install port list includes API port and transports" "$(sbinsports)" "tcp/1 tcp/2 udp/3 udp/4 tcp/5 tcp/40000"
+unset -f ufw firewall-cmd iptables ip6tables; rm -f "$fwl"
 echo "FAILS: $fails"; exit $((fails > 0))

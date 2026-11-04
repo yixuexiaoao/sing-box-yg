@@ -322,7 +322,7 @@ green "执行开放端口，关闭防火墙完毕"
 
 openyn(){
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-readp "是否开放端口，关闭防火墙？\n1、是，执行 (回车默认)\n2、否，跳过！自行处理\n请选择【1-2】：" action
+readp "是否开放端口，关闭防火墙？\n1、是，关闭本机防火墙、放开所有端口 (回车默认)\n2、否，保留防火墙：稍后设置端口时可选择只放行用到的端口 (更安全)\n请选择【1-2】：" action
 if [[ -z $action ]] || [[ "$action" = "1" ]]; then
 close
 elif [[ "$action" = "2" ]]; then
@@ -440,33 +440,42 @@ fi
 
 # 一次输入全部协议端口：顺序 Vless Vmess Hy2 Tuic [Anytls]，空格分隔；0 或留空表示随机
 sbportsline(){
-local names=("Vless-reality" "Vmess-ws" "Hysteria2" "Tuic5") line arr res i v bad
-[[ "$sbnh" != "1.10" ]] && names+=("Anytls")
+local names=("Vless-reality" "Vmess-ws" "Hysteria2" "Tuic5") protos=(TCP TCP UDP UDP) line arr res rnd i v bad ok n ex
+[[ "$sbnh" != "1.10" ]] && names+=("Anytls") && protos+=(TCP)
+n=${#names[@]}
+ex="20001 8080 20003 20004"; [[ $n -eq 5 ]] && ex+=" 20005"
 while :; do
 echo
-yellow "按顺序输入 ${names[*]} 的端口，用空格分隔；某项填 0 表示随机端口"
-yellow "例：20001 8080 20003 20004$([[ ${#names[@]} -eq 5 ]] && echo ' 20005')   (Vmess 若要使用CDN优选，可填 8080/8880/2052/2082/2086/2095，开启TLS时填 443/8443/2053/2083/2087/2096)"
-readp "端口：" line || exit 1
+yellow "请输入 $n 个端口，按以下顺序用空格分隔（某项填 0 表示随机，少填的也随机生成）："
+for ((i=0; i<n; i++)); do echo -e "  $((i+1)). ${names[$i]} [${protos[$i]}]"; done
+yellow "例：$ex"
+yellow "提示：Vmess-ws 要用CDN优选IP时填 8080/8880/2052/2082/2086/2095，开启TLS时填 443/8443/2053/2083/2087/2096"
+readp "请输入 $n 个端口：" line || exit 1
 read -ra arr <<< "${line//,/ }"
-if (( ${#arr[@]} > ${#names[@]} )); then
-red "输入了 ${#arr[@]} 个端口，多于协议数 ${#names[@]}" && continue
+if (( ${#arr[@]} > n )); then
+red "需要 $n 个端口，输入了 ${#arr[@]} 个，多于协议数，请重新输入" && continue
 fi
-res=() bad=
-for ((i=0; i<${#names[@]}; i++)); do
+res=() rnd=() bad=
+for ((i=0; i<n; i++)); do
 v=${arr[$i]:-0}
 if [[ $v == 0 ]]; then
 v=$(shuf -i 10000-65535 -n 1)
 while sbportbusy "$v" || [[ " ${res[*]} " == *" $v "* ]]; do v=$(shuf -i 10000-65535 -n 1); done
+rnd[$i]=1
 elif ! sbportok "$v"; then
-bad="${names[$i]} 端口格式错误：$v (需为1-65535的数字)"; break
+bad="第 $((i+1)) 个（${names[$i]}）端口格式错误：$v (需为1-65535的数字)"; break
 else
 v=$((10#$v))
-if sbportbusy "$v"; then bad="${names[$i]} 端口 $v 已被占用"; break; fi
+if sbportbusy "$v"; then bad="第 $((i+1)) 个（${names[$i]}）端口 $v 已被占用或已分配给API"; break; fi
 if [[ " ${res[*]} " == *" $v "* ]]; then bad="端口 $v 重复"; break; fi
 fi
 res+=("$v")
 done
 [[ -n $bad ]] && red "$bad，请重新输入" && continue
+(( ${#arr[@]} < n )) && yellow "只输入了 ${#arr[@]} 个端口，其余 $((n - ${#arr[@]})) 个已随机生成"
+for ((i=0; i<n; i++)); do echo -e "  ${names[$i]} [${protos[$i]}]：${res[$i]}$([[ -n ${rnd[$i]} ]] && echo '（随机）')"; done
+ok=; readp "回车确认，输入 r 重新输入：" ok
+[[ $ok == [rR] ]] && continue
 break
 done
 port_vl_re=${res[0]}
@@ -478,7 +487,9 @@ port_an=${res[4]:-$(shuf -i 10000-65535 -n 1)}
 sbportok(){
 [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
+# 端口已被监听，或已分配给本次安装的其它协议/API（SBRESERVED）
 sbportbusy(){
+[[ " $SBRESERVED " == *" $1 "* ]] && return 0
 ss -tunlp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$1"
 }
 chooseport(){
@@ -492,7 +503,7 @@ if ! sbportok "$port"; then
 yellow "\n端口格式错误：$port ，请输入1-65535之间的数字"; readp "自定义端口:" port || exit 1; continue
 fi
 if sbportbusy "$port"; then
-yellow "\n端口被占用，请重新输入端口"; readp "自定义端口:" port || exit 1; continue
+yellow "\n端口 $port 已被占用或已分配给其它协议，请重新输入"; readp "自定义端口:" port || exit 1; continue
 fi
 break
 done
@@ -500,91 +511,159 @@ port=$((10#$port))
 blue "确认的端口：$port"
 }
 
+# ---------------------------------------------------------------- 本机防火墙放行端口
+# 规格：tcp/443 udp/20003 …；检测当前生效的防火墙（ufw / firewalld / iptables+ip6tables），只添加放行规则，不改动其它规则
+sbfwkind(){
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then echo ufw; return; fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then echo firewalld; return; fi
+local t
+for t in iptables ip6tables; do
+command -v $t >/dev/null 2>&1 || continue
+if $t -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)'; then echo iptables; return; fi
+done
+echo none
+}
+sbfwopen(){
+local kind spec proto p t
+kind=$(sbfwkind)
+[[ $kind == none ]] && return 0
+for spec in "$@"; do
+proto=${spec%%/*} p=${spec##*/}
+[[ $proto =~ ^(tcp|udp)$ ]] && sbportok "$p" || continue
+case $kind in
+ufw) ufw allow "$p/$proto" >/dev/null 2>&1;;
+firewalld) firewall-cmd --permanent --add-port="$p/$proto" >/dev/null 2>&1;;
+iptables)
+for t in iptables ip6tables; do
+command -v $t >/dev/null 2>&1 || continue
+$t -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || $t -I INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1
+done;;
+esac
+done
+case $kind in
+firewalld) firewall-cmd --reload >/dev/null 2>&1;;
+iptables) netfilter-persistent save >/dev/null 2>&1; service iptables save >/dev/null 2>&1; service ip6tables save >/dev/null 2>&1;;
+esac
+return 0
+}
+# 列出端口并询问是否放行；最后提醒云服务商安全组（只能在商家网页后台放行）
+sbfwask(){
+[[ $# -gt 0 ]] || return 0
+local kind tcp udp spec sel desc
+for spec in "$@"; do [[ $spec == tcp/* ]] && tcp+="${spec#tcp/} " || udp+="${spec#udp/} "; done
+tcp=${tcp% } udp=${udp% }
+desc="${tcp:+TCP $tcp}"; [[ -n $udp ]] && desc+="${desc:+  }UDP $udp"
+kind=$(sbfwkind)
+echo
+if [[ $kind == none ]]; then
+green "本机防火墙未拦截入站连接，无需放行"
+else
+yellow "检测到本机防火墙（$kind）正在拦截入站连接，需要放行：$desc"
+readp "是否自动放行以上端口？1、放行 (回车默认)  2、不放行，我自己处理：" sel
+if [[ $sel != 2 ]]; then
+sbfwopen "$@" && green "已在本机防火墙（$kind）放行：$desc"
+fi
+fi
+yellow "如VPS商家网页后台有安全组/防火墙（如甲骨文、AWS、谷歌云、阿里云、腾讯云），还需在后台放行：$desc"
+}
+
 vlport(){
-readp "\n设置Vless-reality端口 (回车跳过为10000-65535之间的随机端口)：" port
+readp "\n${SBSTEP}设置Vless-reality端口 [TCP] (回车跳过为10000-65535之间的随机端口)：" port
 chooseport
 port_vl_re=$port
 }
 vmport(){
-readp "\n设置Vmess-ws端口 (回车跳过为10000-65535之间的随机端口)：" port
+readp "\n${SBSTEP}设置Vmess-ws端口 [TCP] (回车跳过为随机端口；要用CDN优选IP可填 8080/8880/2052/2082/2086/2095，开TLS时填 443/8443/2053/2083/2087/2096)：" port
 chooseport
 port_vm_ws=$port
 }
 hy2port(){
-readp "\n设置Hysteria2主端口 (回车跳过为10000-65535之间的随机端口)：" port
+readp "\n${SBSTEP}设置Hysteria2主端口 [UDP] (回车跳过为10000-65535之间的随机端口)：" port
 chooseport
 port_hy2=$port
 }
 tu5port(){
-readp "\n设置Tuic5主端口 (回车跳过为10000-65535之间的随机端口)：" port
+readp "\n${SBSTEP}设置Tuic5主端口 [UDP] (回车跳过为10000-65535之间的随机端口)：" port
 chooseport
 port_tu=$port
 }
 anport(){
-readp "\n设置Anytls主端口，最新内核时可用 (回车跳过为10000-65535之间的随机端口)：" port
+readp "\n${SBSTEP}设置Anytls端口 [TCP] (回车跳过为10000-65535之间的随机端口)：" port
 chooseport
 port_an=$port
 }
+# 未被占用、也未分配给其它协议/API的随机端口
+sbrandport(){
+local v
+v=$(shuf -i 10000-65535 -n 1)
+while sbportbusy "$v"; do v=$(shuf -i 10000-65535 -n 1); done
+echo "$v"
+}
+# 本次安装要用到的端口（含API端口），供放行防火墙
+sbinsports(){
+local a=("tcp/$port_vl_re" "tcp/$port_vm_ws" "udp/$port_hy2" "udp/$port_tu")
+[[ "$sbnh" != "1.10" ]] && a+=("tcp/$port_an")
+[[ -n $sbapi_on && -n $apiport ]] && a+=("tcp/$apiport")
+echo "${a[*]}"
+}
 
 insport(){
+local n=4 i
+[[ "$sbnh" != "1.10" ]] && n=5
+# API端口已在第零步选定：协议端口不能与之重复
+SBRESERVED="${sbapi_on:+$apiport}"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-green "三、设置各个协议端口"
-yellow "1：自动生成每个协议的随机端口 (10000-65535范围内)，回车默认。请确保VPS后台已开放所有端口"
-yellow "2：自定义端口：按顺序一次输入全部协议端口，用空格分隔 (推荐)"
-yellow "3：自定义端口：逐个协议输入"
+green "三、设置各个协议端口（共 $n 个：Vless-reality[TCP] Vmess-ws[TCP] Hysteria2[UDP] Tuic5[UDP]$([[ $n -eq 5 ]] && echo ' Anytls[TCP]')）"
+yellow "1：全部随机生成 (10000-65535范围内，回车默认)"
+yellow "2：一次输入全部 $n 个端口，按上面的顺序用空格分隔 (推荐)"
+yellow "3：逐个协议输入"
 readp "请输入【1-3】：" port
 if [ -z "$port" ] || [ "$port" = "1" ] ; then
-ports=()
-for i in {1..5}; do
-while true; do
-port=$(shuf -i 10000-65535 -n 1)
-if ! [[ " ${ports[@]} " =~ " $port " ]] && \
-[[ -z $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] && \
-[[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]; then
-ports+=($port)
-break
-fi
-done
-done
-port_vm_ws=${ports[0]}
-port_vl_re=${ports[1]}
-port_hy2=${ports[2]}
-port_tu=${ports[3]}
-port_an=${ports[4]}
 if [[ $tlsyn == "true" ]]; then
 numbers=("2053" "2083" "2087" "2096" "8443")
 else
 numbers=("8080" "8880" "2052" "2082" "2086" "2095")
 fi
+# Vmess-ws 用支持CDN优选IP的标准端口
+for i in 1 2 3 4 5 6 7 8 9 10; do
 port_vm_ws=${numbers[$RANDOM % ${#numbers[@]}]}
-until [[ -z $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port_vm_ws") ]]
-do
-if [[ $tlsyn == "true" ]]; then
-numbers=("2053" "2083" "2087" "2096" "8443")
-else
-numbers=("8080" "8880" "2052" "2082" "2086" "2095")
-fi
-port_vm_ws=${numbers[$RANDOM % ${#numbers[@]}]}
+sbportbusy "$port_vm_ws" || break
+port_vm_ws=
 done
+[[ -n $port_vm_ws ]] || port_vm_ws=$(sbrandport)
+SBRESERVED+=" $port_vm_ws"
+port_vl_re=$(sbrandport); SBRESERVED+=" $port_vl_re"
+port_hy2=$(sbrandport); SBRESERVED+=" $port_hy2"
+port_tu=$(sbrandport); SBRESERVED+=" $port_tu"
+port_an=$(sbrandport); SBRESERVED+=" $port_an"
 echo
-blue "根据Vmess-ws协议是否启用TLS，随机指定支持CDN优选IP的标准端口：$port_vm_ws"
+blue "Vmess-ws 使用支持CDN优选IP的标准端口：$port_vm_ws"
 elif [ "$port" = "2" ]; then
 sbportsline
 else
-vlport && vmport && hy2port && tu5port
-if [[ "$sbnh" != "1.10" ]]; then
-anport
+SBSTEP="(1/$n) "; vlport; SBRESERVED+=" $port_vl_re"
+SBSTEP="(2/$n) "; vmport; SBRESERVED+=" $port_vm_ws"
+SBSTEP="(3/$n) "; hy2port; SBRESERVED+=" $port_hy2"
+SBSTEP="(4/$n) "; tu5port; SBRESERVED+=" $port_tu"
+if [[ $n -eq 5 ]]; then
+SBSTEP="(5/$n) "; anport; SBRESERVED+=" $port_an"
+else
+port_an=$(sbrandport)
 fi
+SBSTEP=
 fi
 echo
 blue "各协议端口确认如下"
-blue "Vless-reality端口：$port_vl_re"
-blue "Vmess-ws端口：$port_vm_ws"
-blue "Hysteria-2端口：$port_hy2"
-blue "Tuic-v5端口：$port_tu"
-if [[ "$sbnh" != "1.10" ]]; then
-blue "Anytls端口：$port_an"
+blue "Vless-reality：$port_vl_re/TCP"
+blue "Vmess-ws     ：$port_vm_ws/TCP"
+blue "Hysteria2    ：$port_hy2/UDP"
+blue "Tuic5        ：$port_tu/UDP"
+if [[ $n -eq 5 ]]; then
+blue "Anytls       ：$port_an/TCP"
 fi
+[[ -n $sbapi_on ]] && blue "API管理      ：$apiport/TCP"
+sbfwask $(sbinsports)
+SBRESERVED=
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "四、自动生成各个协议统一的uuid (密码)"
 uuid=$(/etc/s-box/sing-box generate uuid)
@@ -2994,18 +3073,21 @@ vlport
 echo $sbfiles | xargs -n1 sed -i "14s/$vl_port/$port_vl_re/"
 restartsb && sbshare > /dev/null 2>&1
 blue "Vless-reality端口更改完成"
+sbfwask "tcp/$port_vl_re"
 echo
 elif [ "$menu" = "5" ]; then
 anport
 echo $sbfiles | xargs -n1 sed -i "110s/$an_port/$port_an/"
 restartsb && sbshare > /dev/null 2>&1
 blue "Anytls端口更改完成"
+sbfwask "tcp/$port_an"
 echo
 elif [ "$menu" = "2" ]; then
 vmport
 echo $sbfiles | xargs -n1 sed -i "41s/$vm_port/$port_vm_ws/"
 restartsb && sbshare > /dev/null 2>&1
 blue "Vmess-ws端口更改完成"
+sbfwask "tcp/$port_vm_ws"
 tls=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].tls.enabled')
 if [[ "$tls" = "false" ]]; then
 blue "切记：如果Argo使用中，临时隧道必须重置，固定隧道的CF设置界面端口必须修改为$port_vm_ws"
@@ -3031,6 +3113,7 @@ echo $sbfiles | xargs -n1 sed -i "67s/$hy2_port/$port_hy2/"
 restartsb && sbshare > /dev/null 2>&1
 fi
 blue "Hysteria2端口更改完成"
+sbfwask "udp/$port_hy2"
 elif [ "$menu" = "2" ]; then
 green "1：添加Hysteria2范围端口"
 green "2：添加Hysteria2单端口"
@@ -3072,6 +3155,7 @@ echo $sbfiles | xargs -n1 sed -i "89s/$tu5_port/$port_tu/"
 restartsb && sbshare > /dev/null 2>&1
 fi
 blue "Tuic5端口更改完成"
+sbfwask "udp/$port_tu"
 elif [ "$menu" = "2" ]; then
 green "1：添加Tuic5范围端口"
 green "2：添加Tuic5单端口"
@@ -4830,14 +4914,13 @@ yellow "9：查看API访问审计日志 (来源IP、操作、结果)"
 yellow "0：返回主菜单"
 readp "请选择【0-9】：" menu
 case "$menu" in
-1 ) $sbag apiinstall >/dev/null && green "API服务已启动" && sbapishow;;
+1 ) $sbag apiinstall >/dev/null && green "API服务已启动" && sbapishow && sbfwask "tcp/$(sbapiport)";;
 2 ) sbapishow;;
 3 ) $sbag apiinstall --regen >/dev/null && green "API密钥已更换，请同步更新Worker面板中的服务器配置" && sbapishow;;
-4 ) readp "输入新的API端口 (回车随机)：" apiport
-if [ -z "$apiport" ]; then
-apiport=$(shuf -i 10000-65535 -n 1)
-fi
-$sbag apiinstall --port "$apiport" >/dev/null && green "API端口已更换" && sbapishow;;
+4 ) readp "输入新的API端口 [TCP] (回车随机)：" port
+chooseport
+apiport=$port
+$sbag apiinstall --port "$apiport" >/dev/null && green "API端口已更换" && sbapishow && sbfwask "tcp/$apiport";;
 5 ) $sbag apiuninstall >/dev/null && green "API服务已卸载";;
 6 ) yellow "1：完全管理  2：只读 + 查看节点链接  3：仅只读  4：完全管理 + 允许面板远程升级脚本与 sing-box 内核"
 yellow "说明：只有选项4允许通过API安装新代码（只从本仓库与 SagerNet 官方发布下载，面板不能指定地址），其余权限都无法在VPS上执行任何命令"
@@ -4864,6 +4947,7 @@ esac
 sbpause && sbapimenu
 }
 
+sbapiport(){ python3 -c 'import json;print(json.load(open("/etc/s-box/sbapi.json"))["port"])' 2>/dev/null; }
 sbapishow(){
 if [[ ! -f /etc/s-box/sbapi.json ]]; then
 yellow "API服务未安装" && return
@@ -4873,7 +4957,7 @@ green "对接信息如下 (整段JSON粘贴到Worker面板「添加服务器」�
 blue "$($sbag apiinfo | python3 -c 'import json,sys;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ("name","host","port","path","token")},ensure_ascii=False))')"
 blue "API权限：$($sbag apiinfo | python3 -c 'import json,sys;m={"read":"只读","links":"节点链接","manage":"管理","upgrade":"远程升级"};print("、".join(m.get(x,x) for x in json.load(sys.stdin)["perms"]))')"
 echo
-yellow "1、请确保VPS后台防火墙已开放该TCP端口：$(python3 -c 'import json;print(json.load(open("/etc/s-box/sbapi.json"))["port"])')"
+yellow "1、请确保VPS防火墙/安全组已开放该TCP端口：$(sbapiport)"
 yellow "2、Token等同于服务器管理权限，切勿泄露；如已泄露请选择3更换"
 yellow "3、如果本机IP为IPV6，Worker也可直接连接"
 }

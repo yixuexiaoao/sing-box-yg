@@ -182,6 +182,21 @@ jobs:
         run: python3 tests/test_sbagent.py
       - name: system DNS (NAT64) logic
         run: bash tests/dns.sh
+      - name: open chosen ports in the active firewall (real ufw, then real iptables)
+        run: |
+          src=$(mktemp)
+          { sed -n '/^yellow(){/p;/^green(){/p;/^readp(){/p' sb.sh; sed -n '/^sbportok(){/,/^}/p;/^sbfwkind(){/,/^}/p;/^sbfwopen(){/,/^}/p' sb.sh; } > "$src"
+          sudo ufw allow 22/tcp > /dev/null; sudo ufw --force enable > /dev/null
+          k=$(sudo bash -c "source $src; sbfwkind"); echo "kind=$k"; [[ $k == ufw ]] || { echo "::error title=fw::ufw not detected ($k)"; exit 1; }
+          sudo bash -c "source $src; sbfwopen tcp/18081 udp/18082"
+          sudo ufw status | tee /dev/stderr | grep -q '18081/tcp' && sudo ufw status | grep -q '18082/udp' || { echo "::error title=fw::ufw rules missing"; exit 1; }
+          sudo ufw --force disable > /dev/null
+          sudo iptables -A INPUT -p tcp --dport 19 -j DROP
+          k=$(sudo bash -c "source $src; sbfwkind"); echo "kind=$k"; [[ $k == iptables ]] || { echo "::error title=fw::iptables not detected ($k)"; exit 1; }
+          sudo bash -c "source $src; sbfwopen tcp/18083; sbfwopen tcp/18083"
+          [[ $(sudo iptables -S INPUT | grep -c -- '--dport 18083 -j ACCEPT') == 1 && $(sudo ip6tables -S INPUT | grep -c -- '--dport 18083 -j ACCEPT') == 1 ]] || { echo "::error title=fw::iptables/ip6tables ACCEPT missing or duplicated"; sudo iptables -S INPUT; exit 1; }
+          sudo iptables -D INPUT -p tcp --dport 19 -j DROP
+          echo ok
       - name: firewall/uninstall keep other programs' rules (real iptables, runner has Docker)
         run: |
           src=$(mktemp)
