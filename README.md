@@ -66,6 +66,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 
 * **主菜单18 防泄露参数重置**：节点或订阅链接泄露后，一键重置 UUID(密码)+Vmess路径、Reality密钥与short_id、本地订阅路径，可选重置Vless/Hy2/Tuic/Anytls端口（端口跳跃自动跟随）。重置前自动备份、`sing-box check` 校验失败自动回滚；重置后自动更新本地订阅、Gitlab订阅并推送TG。支持定时自动重置与泄露检测（N小时内源IP数超过阈值时TG通知或自动重置）
 
+* **一键安装第六步**：可选开启API（端口、权限级别、IP白名单、流量统计），完成后直接显示面板对接信息
+
+* **主菜单17 流量统计**：按源IP/访问地址/日期/小时/协议统计流量，可按时间段查询；日志gzip压缩归档、保留天数、按时间段删除
+
+* **API 安全**：权限分级（只读/查看节点链接/管理），权限、IP白名单、Token 只能在VPS上修改，Token 泄露也无法控制VPS；认证失败自动封禁、重置频率限制、审计日志
+
 * **主菜单19 API管理**：在VPS上启动加密管理API，配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 部署到 Cloudflare Workers，在网页上统一管理多台服务器：查看源IP/访问记录与统计、重置参数、查看节点链接、重启、定时重置与泄露检测设置
 
 * 命令行用法（`/etc/s-box/sbagent.py`）：
@@ -74,6 +80,9 @@ python3 /etc/s-box/sbagent.py logs --limit 100 --ip 1.2.3.4   # 访问记录
 python3 /etc/s-box/sbagent.py stats --hours 24                  # 源IP/访问目标统计
 python3 /etc/s-box/sbagent.py reset all                         # 一键重置(UUID+路径+Reality+订阅路径)
 python3 /etc/s-box/sbagent.py reset full                        # 同上并重置端口
+python3 /etc/s-box/sbagent.py traffic --by host --start 2026-11-01 --ip 1.2.3.4   # 流量统计
+python3 /etc/s-box/sbagent.py logprune --days 30                # 删除30天以前的日志
+python3 /etc/s-box/sbagent.py apiset --perms read,links          # 修改API权限（仅本机）
 ```
 
 * 详细变更见 [CHANGELOG.md](CHANGELOG.md)
