@@ -37,7 +37,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
@@ -2210,11 +2210,41 @@ def api_uninstall():
     return {"removed": True}
 
 
+def _public_ip(text):
+    try:
+        ip = ipaddress.ip_address(text.strip().strip("[]"))
+    except ValueError:
+        return ""
+    return str(ip) if ip.is_global else ""
+
+
+def detect_public_ip():
+    """本机公网IP：Cloudflare trace（直连IP，不依赖DNS）→ 云平台元数据（谷歌云/AWS/Azure 网卡上只有内网IP）。"""
+    probes = [("https://1.1.1.1/cdn-cgi/trace", {}), ("https://[2606:4700:4700::1111]/cdn-cgi/trace", {}),
+              ("http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip",
+               {"Metadata-Flavor": "Google"}),
+              ("http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress"
+               "?api-version=2021-02-01&format=text", {"Metadata": "true"})]
+    for url, headers in probes:
+        try:
+            req = urllib.request.Request(url, headers=dict(headers, **{"User-Agent": "sbagent/" + VERSION}))
+            with urllib.request.urlopen(req, timeout=3) as r:
+                body = r.read(4096).decode("utf-8", "replace")
+        except Exception:
+            continue
+        m = re.search(r"^ip=(\S+)", body, re.M)
+        ip = _public_ip(m.group(1) if m else body)
+        if ip:
+            return ip
+    return ""
+
+
 def api_info():
     conf = load_json(API_CONF, None)
     if not conf:
         return None
-    host = read(os.path.join(SB_DIR, "server_ip.log")).strip().strip("[]") or socket.gethostname()
+    # 不再回退为主机名：主机名在公网上无法解析，Worker 会连接失败（Stream was cancelled）
+    host = _public_ip(read(os.path.join(SB_DIR, "server_ip.log"))) or detect_public_ip() or "请填写服务器公网IP"
     return {"name": socket.gethostname(), "host": host, "port": conf["port"], "path": conf.get("path", "/api"),
             "token": conf["token"], "running": svc_active("sbagent"), "perms": conf.get("perms") or list(PERMS),
             "allow": conf.get("allow") or [], "reset_interval": conf.get("reset_interval", 600)}

@@ -156,11 +156,50 @@ green "TUN守护功能已启动"
 fi
 fi
 fi
+# 本机公网IP：依次尝试，取第一个格式正确的结果
+#   1. Cloudflare trace（直接访问IP地址，不依赖DNS） 2. 多个公共IP服务
+#   3. 云服务器元数据（谷歌云/AWS/Azure 的网卡上只有内网IP，公网IP由云平台NAT映射，只能从元数据取得）
+#   4. 网卡上的公网地址
+sbisip4(){ [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && ! [[ $1 =~ ^(10|127|169\.254|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\. ]]; }
+sbisip6(){ [[ $1 =~ ^[0-9a-fA-F:]+$ && $1 == *:*:* ]] && ! [[ ${1,,} =~ ^(fe80|fc|fd|::1$) ]]; }
+sbpubip(){
+local f=$1 v u
+local chk=sbisip$f
+v=$(curl -s${f}m4 "$([[ $f == 4 ]] && echo https://1.1.1.1 || echo 'https://[2606:4700:4700::1111]')/cdn-cgi/trace" 2>/dev/null | sed -n 's/^ip=//p')
+$chk "$v" && { echo "$v"; return 0; }
+for u in icanhazip.com api64.ipify.org ifconfig.me ip.sb; do
+v=$(curl -s${f}m4 -k "https://$u" 2>/dev/null | tr -d ' \r\n')
+$chk "$v" && { echo "$v"; return 0; }
+done
+if [[ $f == 4 ]]; then
+v=$(curl -sm2 -H 'Metadata-Flavor: Google' http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip 2>/dev/null)
+$chk "$v" && { echo "$v"; return 0; }
+u=$(curl -sm2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null)
+v=$(curl -sm2 ${u:+-H "X-aws-ec2-metadata-token: $u"} http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null)
+$chk "$v" && { echo "$v"; return 0; }
+v=$(curl -sm2 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text' 2>/dev/null)
+$chk "$v" && { echo "$v"; return 0; }
+else
+v=$(curl -sm2 -H 'Metadata-Flavor: Google' http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/ipv6s 2>/dev/null | head -n1 | cut -d/ -f1)
+$chk "$v" && { echo "$v"; return 0; }
+fi
+for v in $(ip -$f -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
+$chk "$v" && { echo "$v"; return 0; }
+done
+return 1
+}
+# 云平台（用于提示在哪里放行端口）
+sbcloud(){
+[[ $vi == google ]] || curl -sfm2 -o /dev/null -H 'Metadata-Flavor: Google' http://169.254.169.254/computeMetadata/v1/ 2>/dev/null && { echo google; return; }
+[[ $vi == amazon ]] && { echo aws; return; }
+[[ $vi == microsoft ]] && { echo azure; return; }
+echo other
+}
 # 本机IP/地区的4个查询并行执行；v4v6_start 可提前在后台启动，v4v6_collect 取结果
 v4v6_start(){
 sbv46d=$(mktemp -d 2>/dev/null) || { sbv46d=/tmp/sbv4v6.$$; mkdir -p "$sbv46d"; }
-curl -s4m5 icanhazip.com -k > "$sbv46d/v4" 2>/dev/null & sbv46p="$!"
-curl -s6m5 icanhazip.com -k > "$sbv46d/v6" 2>/dev/null & sbv46p="$sbv46p $!"
+sbpubip 4 > "$sbv46d/v4" 2>/dev/null & sbv46p="$!"
+sbpubip 6 > "$sbv46d/v6" 2>/dev/null & sbv46p="$sbv46p $!"
 curl -s4m5 -k https://ip.fm > "$sbv46d/d4" 2>/dev/null & sbv46p="$sbv46p $!"
 curl -s6m5 -k https://ip.fm > "$sbv46d/d6" 2>/dev/null & sbv46p="$sbv46p $!"
 }
@@ -564,7 +603,18 @@ if [[ $sel != 2 ]]; then
 sbfwopen "$@" && green "已在本机防火墙（$kind）放行：$desc"
 fi
 fi
-yellow "如VPS商家网页后台有安全组/防火墙（如甲骨文、AWS、谷歌云、阿里云、腾讯云），还需在后台放行：$desc"
+case $(sbcloud) in
+google)
+local rules="" x
+for x in $tcp; do rules+="tcp:$x,"; done
+for x in $udp; do rules+="udp:$x,"; done
+red "谷歌云：必须在 VPC 防火墙放行以上端口，否则外部（包括 Worker 面板）无法连接"
+yellow "方法1：控制台 → VPC网络 → 防火墙 → 创建防火墙规则：方向「入站」、目标「网络中的所有实例」、来源IPv4范围 0.0.0.0/0、指定的协议和端口填入以上端口"
+yellow "方法2：在控制台右上角 Cloud Shell 中执行："
+echo "gcloud compute firewall-rules create sing-box-yg-$(date +%m%d%H%M) --direction=INGRESS --action=ALLOW --source-ranges=0.0.0.0/0 --rules=${rules%,}"
+;;
+*) yellow "如VPS商家网页后台有安全组/防火墙（如甲骨文、AWS、谷歌云、阿里云、腾讯云），还需在后台放行：$desc";;
+esac
 }
 
 vlport(){
@@ -1208,7 +1258,14 @@ echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 fi
 else
 yellow "VPS并不是双栈VPS，不支持IP配置输出的切换"
-serip=$(curl -s4m5 icanhazip.com -k || curl -s6m5 icanhazip.com -k)
+serip=${v4:-$v6}
+# 所有方式都取不到公网IP：节点链接与API对接信息都需要它，请用户手动填写，不留空
+while [[ -z $serip ]]; do
+red "未能自动获取本机公网IP（谷歌云等平台可在控制台「外部IP」一栏查看）"
+readp "请输入本机公网IPv4或IPv6地址：" serip || break
+serip=${serip#[}; serip=${serip%]}
+sbisip4 "$serip" || sbisip6 "$serip" || { red "IP格式不正确或为内网地址：$serip"; serip=; }
+done
 if [[ "$serip" =~ : ]]; then
 server_ip="[$serip]"
 echo "$server_ip" > /etc/s-box/server_ip.log

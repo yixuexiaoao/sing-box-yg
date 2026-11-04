@@ -390,5 +390,20 @@ if os.name != "nt" and A.core_arch():
     except RuntimeError as e:
         check("恢复" in str(e) and open(A.SB_BIN, "rb").read() == after, "core that does not stay running is rolled back")
     rs.shutdown()
+# ---------------- API 对接信息中的服务器地址：不能是主机名或内网IP（谷歌云网卡上只有内网IP）
+A.write(A.API_CONF, json.dumps({"port": 12345, "token": "t" * 32, "path": "/p"}))
+ip_file = os.path.join(A.SB_DIR, "server_ip.log")
+old_detect = A.detect_public_ip
+A.detect_public_ip = lambda: ""
+A.write(ip_file, "")
+check(A.api_info()["host"] == "请填写服务器公网IP", "no public IP -> placeholder instead of hostname")
+A.write(ip_file, "10.128.0.2")
+check(A.api_info()["host"] == "请填写服务器公网IP", "private IP in server_ip.log not used as API host")
+A.detect_public_ip = lambda: "34.1.2.3"
+check(A.api_info()["host"] == "34.1.2.3", "falls back to detected public IP (cloud metadata / trace)")
+A.write(ip_file, "[2001:4860::8] ")
+check(A.api_info()["host"] == "2001:4860::8", "public IPv6 from server_ip.log used (brackets stripped)")
+A.detect_public_ip = old_detect
+os.remove(A.API_CONF)
 shutil.rmtree(T, ignore_errors=True)
 print("FAILS:", fails); sys.exit(1 if fails else 0)

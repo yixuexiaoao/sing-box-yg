@@ -1,7 +1,7 @@
 #!/bin/bash
 # 输入清洗与端口校验测试：从 sb.sh 提取真实函数运行（bash tests/input.sh）
 cd "$(dirname "$0")/.." || exit 1
-source <(sed -n '/^yellow(){/p;/^blue(){/p;/^red(){/p;/^green(){/p;/^readp(){/p' sb.sh; sed -n '/^sbclean(){/,/^}/p;/^sbportok(){/,/^}/p;/^sbportbusy(){/,/^}/p;/^chooseport(){/,/^}/p;/^sbportsline(){/,/^}/p;/^sbfwkind(){/,/^}/p;/^sbfwopen(){/,/^}/p;/^sbfwask(){/,/^}/p;/^sbrandport(){/,/^}/p;/^sbinsports(){/,/^}/p' sb.sh)
+source <(sed -n '/^yellow(){/p;/^blue(){/p;/^red(){/p;/^green(){/p;/^readp(){/p' sb.sh; sed -n '/^sbclean(){/,/^}/p;/^sbportok(){/,/^}/p;/^sbportbusy(){/,/^}/p;/^chooseport(){/,/^}/p;/^sbportsline(){/,/^}/p;/^sbfwkind(){/,/^}/p;/^sbfwopen(){/,/^}/p;/^sbfwask(){/,/^}/p;/^sbrandport(){/,/^}/p;/^sbinsports(){/,/^}/p;/^sbisip4(){/p;/^sbisip6(){/p' sb.sh)
 export LANG=en_US.UTF-8
 sleep(){ :; }
 ss(){ printf 'udp UNCONN 0 0 0.0.0.0:20001 0.0.0.0:* users:(("x"))\n'; }
@@ -82,6 +82,7 @@ FW=firewalld; : > "$fwl"; sbfwopen tcp/443
 t "firewall: firewalld permanent + reload" "$(tr '\n' ';' < "$fwl")" "firewall-cmd --permanent --add-port=443/tcp;firewall-cmd --reload;"
 FW=iptables; : > "$fwl"; sbfwopen udp/20003
 t "firewall: iptables/ip6tables insert ACCEPT (v4+v6)" "$(tr '\n' ';' < "$fwl")" "iptables -I INPUT -p udp --dport 20003 -j ACCEPT;ip6tables -I INPUT -p udp --dport 20003 -j ACCEPT;"
+sbcloud(){ echo other; }
 FW=none; : > "$fwl"; out=$(sbfwask tcp/443 udp/20003 2>&1)
 t "firewall: nothing blocking -> no rules, says so, reminds security group" "$(wc -c < "$fwl")|$(echo "$out" | grep -c '无需放行')|$(echo "$out" | grep -c '安全组.*TCP 443  UDP 20003')" "0|1|1"
 FW=ufw; : > "$fwl"; out=$(sbfwask tcp/443 <<< "2" 2>&1)
@@ -91,4 +92,12 @@ t "firewall: Enter = open" "$(tr '\n' ';' < "$fwl")" "ufw allow 443/tcp;"
 sbnh=1.12; sbapi_on=1; apiport=40000; port_vl_re=1; port_vm_ws=2; port_hy2=3; port_tu=4; port_an=5
 t "install port list includes API port and transports" "$(sbinsports)" "tcp/1 tcp/2 udp/3 udp/4 tcp/5 tcp/40000"
 unset -f ufw firewall-cmd iptables ip6tables; rm -f "$fwl"
+
+# ---- 公网IP判断（谷歌云网卡上是内网IP；不能把主机名/内网地址当作服务器地址）
+r=""; for x in 34.1.2.3 10.128.0.2 172.16.0.1 172.32.0.1 192.168.1.1 169.254.169.254 127.0.0.1 free-e2micro 2001:4860::1 fe80::1 fd12::1; do (sbisip4 "$x" || sbisip6 "$x") && r+="$x "; done
+t "public IP check: private/link-local/hostnames rejected" "$r" "34.1.2.3 172.32.0.1 2001:4860::1 "
+sbcloud(){ echo google; }; ufw(){ [[ $1 == status ]] && echo "Status: inactive"; }; iptables(){ echo "-P INPUT ACCEPT"; }; ip6tables(){ echo "-P INPUT ACCEPT"; }
+out=$(sbfwask tcp/443 udp/20003 2>&1)
+t "google cloud: tells to open VPC firewall with a ready gcloud command" "$(echo "$out" | grep -c 'VPC 防火墙')|$(echo "$out" | grep -cE '^gcloud compute firewall-rules create sing-box-yg-[0-9]+ .*--rules=tcp:443,udp:20003$')" "1|1"
+unset -f sbcloud ufw iptables ip6tables
 echo "FAILS: $fails"; exit $((fails > 0))
