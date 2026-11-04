@@ -82,6 +82,27 @@ jobs:
             exit 1
           fi
 
+      - name: systemd service (same unit as sb.sh)
+        run: |
+          D="$PWD/sbox"
+          sudo mkdir -p /etc/s-box
+          sudo cp "$D"/* /etc/s-box/ && sudo cp ./sing-box-bin /etc/s-box/sing-box
+          sudo sed -i "s#$D#/etc/s-box#g" /etc/s-box/*.json
+          sudo rm -f /etc/s-box/sing-box.log*
+          sudo chown -R root:root /etc/s-box && sudo chmod 600 /etc/s-box/private.key
+          awk '/cat > \/etc\/systemd\/system\/sing-box.service <<EOF/{f=1;next} f&&/^EOF$/{exit} f' sb.sh | sed 's/\\\$MAINPID/$MAINPID/' | sudo tee /etc/systemd/system/sing-box.service
+          sudo systemctl daemon-reload
+          sudo systemctl start sing-box
+          sleep 6
+          st=$(systemctl is-active sing-box || true)
+          echo "state=$st"
+          if [[ "$st" != "active" ]]; then
+            msg=$( (sudo journalctl -u sing-box -n 15 --no-pager -o cat; sudo tail -n 10 /etc/s-box/sing-box.log 2>/dev/null) | tr '\n' ' ' | cut -c1-1500)
+            echo "::error title=systemd sing-box ${{ steps.dl.outputs.version }} not active ($st)::$msg"
+            exit 1
+          fi
+          sudo tail -n 5 /etc/s-box/sing-box.log || true
+
   agent:
     runs-on: ubuntu-latest
     steps:

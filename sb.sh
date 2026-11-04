@@ -921,6 +921,18 @@ systemctl restart sing-box
 fi
 }
 
+sbdiag(){
+yellow "配置检查 (sing-box check)："
+/etc/s-box/sing-box check -c /etc/s-box/sb.json 2>&1 | tail -n 5
+yellow "最近运行日志："
+if [[ -s /etc/s-box/sing-box.log ]]; then
+tail -n 10 /etc/s-box/sing-box.log
+elif command -v journalctl >/dev/null 2>&1; then
+journalctl -u sing-box -n 10 --no-pager -o cat 2>/dev/null
+fi
+yellow "可将以上信息反馈，或尝试主菜单8切换内核版本"
+}
+
 ipuuid(){
 if command -v apk >/dev/null 2>&1; then
 status_cmd="rc-service sing-box status"
@@ -929,6 +941,11 @@ else
 status_cmd="systemctl is-active sing-box"
 status_pattern="active"
 fi
+# 刚启动/重启时服务可能尚未就绪，最多等待5秒
+for i in 1 2 3 4 5; do
+[[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") ]] && break
+sleep 1
+done
 if [[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") && -f '/etc/s-box/sb.json' ]]; then
 v4v6
 if [[ -n $v4 && -n $v6 ]]; then
@@ -963,7 +980,9 @@ echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 fi
 fi
 else
-red "Sing-box服务未运行" && exit
+red "Sing-box服务未运行"
+sbdiag
+exit
 fi
 }
 
