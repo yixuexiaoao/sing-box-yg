@@ -35,6 +35,7 @@ else
 red "脚本不支持当前的系统，请选择使用Ubuntu,Debian,Centos系统。" && exit
 fi
 export sbfiles="/etc/s-box/sb10.json /etc/s-box/sb11.json /etc/s-box/sb.json"
+export sbrepo="https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main"
 export sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
 vsid=$(grep -i version_id /etc/os-release | cut -d \" -f2 | cut -d . -f1)
 op=$(cat /etc/redhat-release 2>/dev/null || cat /etc/os-release 2>/dev/null | grep -i pretty_name | cut -d \" -f2)
@@ -304,7 +305,7 @@ if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
 zqzs
 else
 bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/acme-yg/main/acme.sh)
-if [[ ! -f /root/ygkkkca/cert.crt && ! -f /root/ygkkkca/private.key && ! -s /root/ygkkkca/cert.crt && ! -s /root/ygkkkca/private.key ]]; then
+if [[ ! -s /root/ygkkkca/cert.crt || ! -s /root/ygkkkca/private.key ]]; then
 red "Acme证书申请失败，继续使用自签证书" 
 zqzs
 else
@@ -425,7 +426,7 @@ cat > /etc/s-box/sb10.json <<EOF
 "log": {
     "disabled": false,
     "level": "info",
-    "timestamp": true
+    "timestamp": true, "output": "/etc/s-box/sing-box.log"
   },
   "inbounds": [
     {
@@ -669,7 +670,7 @@ cat > /etc/s-box/sb11.json <<EOF
 "log": {
     "disabled": false,
     "level": "info",
-    "timestamp": true
+    "timestamp": true, "output": "/etc/s-box/sing-box.log"
   },
   "inbounds": [
     {
@@ -1050,6 +1051,7 @@ sb_hy2_ip=$ym
 cl_hy2_ip=$ym
 ins_hy2=0
 hy2_ins=false
+SHA256=
 fi
 tu5_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[3].listen_port')
 ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
@@ -1157,7 +1159,7 @@ echo
 reshy2(){
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=0&allowInsecure=0$hyps&sni=$hy2_name&pinSHA256=$SHA256#hy2-$hostname"
+hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=0&allowInsecure=0$hyps&sni=$hy2_name${SHA256:+&pinSHA256=$SHA256}#hy2-$hostname"
 #hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$ins_hy2&allowInsecure=$ins_hy2$hyps&sni=$hy2_name#hy2-$hostname"
 echo "$hy2_link" > /etc/s-box/hy2.txt
 red "🚀【 Hysteria-2 】节点信息如下：" && sleep 2
@@ -1190,7 +1192,7 @@ echo
 resan(){
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-an_link="anytls://$uuid@$sb_an_ip:$an_port?&sni=$an_name&allowInsecure=$ins_an&insecure=$ins_an#anytls-$hostname"
+an_link="anytls://$uuid@$sb_an_ip:$an_port?sni=$an_name&allowInsecure=$ins_an&insecure=$ins_an#anytls-$hostname"
 echo "$an_link" > /etc/s-box/an.txt
 red "🚀【 Anytls】节点信息如下：" && sleep 2
 echo
@@ -2369,6 +2371,7 @@ fi
 cloudflaredargo(){
 if [ ! -e /etc/s-box/cloudflared ]; then
 case $(uname -m) in
+armv7l) cpu=arm;;
 aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
 esac
@@ -2453,7 +2456,8 @@ rc-service argo stop >/dev/null 2>&1
 rc-update del argo default >/dev/null 2>&1
 rm -rf /etc/init.d/argo
 fi
-rm -rf /etc/s-box/vm_ws_argogd.txt /etc/s-box/cloudflared
+rm -rf /etc/s-box/vm_ws_argogd.txt
+ps -ef 2>/dev/null | grep -q "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')" || rm -rf /etc/s-box/cloudflared
 sbshare > /dev/null 2>&1
 green "Argo固定隧道已停止"
 else
@@ -2503,7 +2507,8 @@ crontab -l 2>/dev/null > /tmp/crontab.tmp
 sed -i '/url http/d' /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
-rm -rf /etc/s-box/vm_ws_argols.txt /etc/s-box/cloudflared
+rm -rf /etc/s-box/vm_ws_argols.txt
+ps -ef 2>/dev/null | grep -q '[c]loudflared.*run' || rm -rf /etc/s-box/cloudflared
 rm -rf /etc/local.d/alpineargo.start
 sbshare > /dev/null 2>&1
 green "Argo临时隧道已停止"
@@ -2539,7 +2544,7 @@ inssbjsonser
 sbservice
 sbactive
 #curl -sL https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/version/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
+curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 lnsb && blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
 echo
@@ -2818,7 +2823,7 @@ changeport
 fi
 elif [ "$menu" = "3" ]; then
 if [ -n "$hy2_ports" ]; then
-hy2deports && sbshare > /dev/null 2>&1 yellow "Hysteria2多端口已删除" && changeport
+hy2deports && sbshare > /dev/null 2>&1 && yellow "Hysteria2多端口已删除" && changeport
 else
 sbshare > /dev/null 2>&1 && yellow "Hysteria2未设置多端口" && changeport
 fi
@@ -2859,7 +2864,7 @@ changeport
 fi
 elif [ "$menu" = "3" ]; then
 if [ -n "$tu5_ports" ]; then
-tu5deports && sbshare > /dev/null 2>&1 yellow "Tuic5多端口已删除" && changeport
+tu5deports && sbshare > /dev/null 2>&1 && yellow "Tuic5多端口已删除" && changeport
 else
 sbshare > /dev/null 2>&1 && yellow "Tuic5未设置多端口" && changeport
 fi
@@ -3099,7 +3104,8 @@ subtoken="$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uu
 else
 subtoken="$menu"
 fi
-rm -rf /root/websbox/"$(cat /etc/s-box/subtoken.log 2>/dev/null)"
+oldsubtoken=$(cat /etc/s-box/subtoken.log 2>/dev/null)
+[ -n "$oldsubtoken" ] && rm -rf /root/websbox/"$oldsubtoken"
 echo $subtoken > /etc/s-box/subtoken.log
 green "订阅链接路径密码：$(cat /etc/s-box/subtoken.log 2>/dev/null)"
 }
@@ -3809,6 +3815,7 @@ cronsb(){
 uncronsb
 crontab -l 2>/dev/null > /tmp/crontab.tmp
 echo "0 1 * * * systemctl restart sing-box;rc-service sing-box restart" >> /tmp/crontab.tmp
+echo '*/10 * * * * f=/etc/s-box/sing-box.log; [ -f $f ] && [ $(wc -c < $f) -gt 10485760 ] && cp -f $f $f.1 && : > $f' >> /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 }
@@ -3818,14 +3825,20 @@ sed -i '/sing-box/d' /tmp/crontab.tmp
 sed -i '/sbwpph/d' /tmp/crontab.tmp
 sed -i '/url http/d' /tmp/crontab.tmp
 sed -i '/websbox/d' /tmp/crontab.tmp
+sed -i '/sbagent/d' /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 }
 
 lnsb(){
 rm -rf /usr/bin/sb
-curl -L -o /usr/bin/sb -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh
+curl -L -o /usr/bin/sb -# --retry 2 --insecure ${sbrepo}/sb.sh
 chmod +x /usr/bin/sb
+if [[ -d /etc/s-box ]]; then
+curl -sL -o /etc/s-box/sbagent.py.tmp --retry 2 ${sbrepo}/sbagent.py && grep -q 'sbagent' /etc/s-box/sbagent.py.tmp && mv -f /etc/s-box/sbagent.py.tmp /etc/s-box/sbagent.py
+rm -f /etc/s-box/sbagent.py.tmp
+if command -v apk >/dev/null 2>&1; then rc-service sbagent status >/dev/null 2>&1 && rc-service sbagent restart >/dev/null 2>&1; else systemctl is-active sbagent >/dev/null 2>&1 && systemctl restart sbagent >/dev/null 2>&1; fi
+fi
 }
 
 upsbyg(){
@@ -3833,7 +3846,7 @@ if [[ ! -f '/usr/bin/sb' ]]; then
 red "未正常安装Sing-box-yg" && exit
 fi
 lnsb
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
+curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
 }
 
@@ -3902,17 +3915,17 @@ fi
 
 unins(){
 if command -v apk >/dev/null 2>&1; then
-for svc in sing-box argo; do
+for svc in sing-box argo sbagent; do
 rc-service "$svc" stop >/dev/null 2>&1
 rc-update del "$svc" default >/dev/null 2>&1
 done
-rm -rf /etc/init.d/{sing-box,argo}
+rm -rf /etc/init.d/{sing-box,argo,sbagent}
 else
-for svc in sing-box argo; do
+for svc in sing-box argo sbagent; do
 systemctl stop "$svc" >/dev/null 2>&1
 systemctl disable "$svc" >/dev/null 2>&1
 done
-rm -rf /etc/systemd/system/{sing-box.service,argo.service}
+rm -rf /etc/systemd/system/{sing-box.service,argo.service,sbagent.service}
 fi
 ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '.inbounds[1].listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
@@ -3924,13 +3937,15 @@ iptables -t nat -F PREROUTING >/dev/null 2>&1
 netfilter-persistent save >/dev/null 2>&1
 service iptables save >/dev/null 2>&1
 green "Sing-box卸载完成！"
-blue "欢迎继续使用Sing-box-yg脚本：bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)"
+blue "欢迎继续使用Sing-box-yg脚本：bash <(curl -Ls ${sbrepo}/sb.sh)"
 echo
 }
 
 sblog(){
 red "退出日志 Ctrl+c"
-if command -v apk >/dev/null 2>&1; then
+if [[ -f /etc/s-box/sing-box.log ]] && grep -q '"output"' /etc/s-box/sb.json 2>/dev/null; then
+tail -n 100 -f /etc/s-box/sing-box.log
+elif command -v apk >/dev/null 2>&1; then
 yellow "暂不支持alpine查看日志"
 else
 #systemctl status sing-box
@@ -4151,8 +4166,9 @@ if [ ! -e /etc/s-box/sbwpph ]; then
 case $(uname -m) in
 aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
+*) red "WARP-plus-Socks5暂不支持$(uname -m)架构" && return 1;;
 esac
-curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sbwpph_$cpu
+curl -L -o /etc/s-box/sbwpph -# --retry 2 --insecure ${sbrepo}/sbwpph_$cpu
 chmod +x /etc/s-box/sbwpph
 fi
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
@@ -4184,7 +4200,7 @@ sed -i "165s/$s5port/$port/g" /etc/s-box/sb11.json
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 restartsb
 }
-unins(){
+uninswpph(){
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 rm -rf /etc/s-box/sbwpph.log
 crontab -l 2>/dev/null > /tmp/crontab.tmp
@@ -4217,20 +4233,20 @@ yellow "3：停止WARP-plus-Socks5代理模式"
 yellow "0：返回上层"
 readp "请选择【0-3】：" menu
 if [ "$menu" = "1" ]; then
-ins
+ins || exit
 nohup /etc/s-box/sbwpph -b 127.0.0.1:$port -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 &
 green "申请IP中……请稍等……" && sleep 20
 resv1=$(curl -sm3 --socks5 localhost:$port icanhazip.com)
 resv2=$(curl -sm3 -x socks5h://localhost:$port icanhazip.com)
 if [[ -z $resv1 && -z $resv2 ]]; then
-red "WARP-plus-Socks5的IP获取失败" && unins && exit
+red "WARP-plus-Socks5的IP获取失败" && uninswpph && exit
 else
 echo "/etc/s-box/sbwpph -b 127.0.0.1:$port -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1" > /etc/s-box/sbwpph.log
 aplws5
 green "WARP-plus-Socks5的IP获取成功，可进行Socks5代理分流"
 fi
 elif [ "$menu" = "2" ]; then
-ins
+ins || exit
 echo '
 奥地利（AT）
 澳大利亚（AU）
@@ -4271,17 +4287,222 @@ green "申请IP中……请稍等……" && sleep 20
 resv1=$(curl -sm3 --socks5 localhost:$port icanhazip.com)
 resv2=$(curl -sm3 -x socks5h://localhost:$port icanhazip.com)
 if [[ -z $resv1 && -z $resv2 ]]; then
-red "WARP-plus-Socks5的IP获取失败，尝试换个国家地区吧" && unins && exit
+red "WARP-plus-Socks5的IP获取失败，尝试换个国家地区吧" && uninswpph && exit
 else
 echo "/etc/s-box/sbwpph -b 127.0.0.1:$port --cfon --country $guojia -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1" > /etc/s-box/sbwpph.log
 aplws5
 green "WARP-plus-Socks5的IP获取成功，可进行Socks5代理分流"
 fi
 elif [ "$menu" = "3" ]; then
-unins && green "已停止WARP-plus-Socks5代理功能"
+uninswpph && green "已停止WARP-plus-Socks5代理功能"
 else
 sb
 fi
+}
+
+sbagentchk(){
+if ! command -v python3 >/dev/null 2>&1; then
+green "安装python3依赖……"
+if command -v apk >/dev/null 2>&1; then
+apk add python3
+elif [ -x "$(command -v apt-get)" ]; then
+apt-get install -y python3
+elif [ -x "$(command -v yum)" ]; then
+yum install -y python3
+elif [ -x "$(command -v dnf)" ]; then
+dnf install -y python3
+fi
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+red "python3安装失败，无法使用该功能" && return 1
+fi
+if [[ ! -s /etc/s-box/sbagent.py ]]; then
+curl -sL -o /etc/s-box/sbagent.py.tmp --retry 2 ${sbrepo}/sbagent.py && grep -q 'sbagent' /etc/s-box/sbagent.py.tmp && mv -f /etc/s-box/sbagent.py.tmp /etc/s-box/sbagent.py
+rm -f /etc/s-box/sbagent.py.tmp
+fi
+if [[ ! -s /etc/s-box/sbagent.py ]]; then
+red "sbagent.py下载失败，请检查VPS能否访问Github" && return 1
+fi
+sbag="env PYTHONIOENCODING=utf-8 python3 /etc/s-box/sbagent.py"
+}
+
+sbpause(){
+echo
+readp "按回车键返回……" pausekey
+}
+
+sbaccesslog(){
+sbactive
+sbagentchk || return
+if $sbag logstatus 2>/dev/null | grep -q '"enabled": true'; then
+logst="${green}已开启${plain}"
+else
+logst="${red}未开启${plain}"
+fi
+echo
+green "连接访问日志：记录每个连接的源IP、协议、访问目标(含嗅探域名)、出站通道，以及认证失败/主动探测"
+echo -e "当前状态：$logst  日志文件：/etc/s-box/sing-box.log (超过10MB自动轮转)"
+yellow "注意：Vmess经Argo/CDN转发时，源IP显示为127.0.0.1或CDN节点IP"
+echo
+yellow "1：开启连接日志记录"
+yellow "2：关闭连接日志记录"
+yellow "3：查看最近访问记录 (时间/协议/源IP/访问目标/出站)"
+yellow "4：按源IP统计 (连接数、失败次数、常访问目标)"
+yellow "5：按访问目标统计 (访问次数、来源IP数)"
+yellow "6：查询指定源IP或访问目标的记录"
+yellow "7：查看认证失败/主动探测记录"
+yellow "8：查看当前在线客户端IP"
+yellow "9：实时查看原始日志"
+yellow "10：清空日志"
+yellow "0：返回主菜单"
+readp "请选择【0-10】：" menu
+case "$menu" in
+1 ) $sbag logon >/dev/null && green "连接日志已开启";;
+2 ) $sbag logoff >/dev/null && green "连接日志已关闭";;
+3 ) readp "显示最近几条记录 (回车默认50)：" num
+$sbag logs --limit "${num:-50}";;
+4 ) readp "统计最近几小时 (回车默认24)：" hours
+$sbag stats --by ip --hours "${hours:-24}";;
+5 ) readp "统计最近几小时 (回车默认24)：" hours
+$sbag stats --by dest --hours "${hours:-24}";;
+6 ) readp "输入源IP (可部分匹配，回车跳过)：" qip
+readp "输入访问目标关键字 (如 google，回车跳过)：" qkw
+$sbag logs --limit 300 ${qip:+--ip "$qip"} ${qkw:+--q "$qkw"};;
+7 ) $sbag logs --err --limit 100;;
+8 ) $sbag peers;;
+9 ) red "退出 Ctrl+c" && tail -n 50 -f /etc/s-box/sing-box.log;;
+10 ) $sbag clearlog >/dev/null && green "日志已清空";;
+* ) sb;;
+esac
+sbpause && sbaccesslog
+}
+
+sbresetgo(){
+yellow "重置后旧的节点链接与订阅链接立即失效，所有客户端需要重新导入新节点"
+readp "确认重置？(y/N)：" yn
+if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
+return
+fi
+green "正在重置参数并重启Sing-box，请稍等……"
+if $sbag reset "$1"; then
+echo
+green "参数重置完成，最新节点与订阅链接如下 (已自动同步本地订阅/Gitlab订阅/TG推送)："
+echo
+$sbag links --plain
+else
+red "重置失败，配置已自动回滚"
+fi
+}
+
+sbresetmenu(){
+sbactive
+sbagentchk || return
+echo
+green "防泄露参数重置：节点或订阅链接泄露后，一键更换参数使旧链接全部失效"
+lastreset=$(tail -n 1 /etc/s-box/sbreset.log 2>/dev/null)
+[[ -n $lastreset ]] && blue "上次重置：$lastreset"
+schedcron=$($sbag schedule | grep -o '"cron": "[^"]*"' | cut -d'"' -f4)
+blue "定时重置：${schedcron:-未设置}"
+echo
+yellow "1：一键重置【UUID(密码)+Vmess路径+Reality密钥+订阅路径】(推荐)"
+yellow "2：一键重置全部【选项1 + Vless/Hy2/Tuic/Anytls端口】"
+yellow "3：仅重置UUID(密码)与Vmess路径"
+yellow "4：仅重置Reality密钥对与short_id"
+yellow "5：仅重置Vless/Hy2/Tuic/Anytls端口 (Vmess端口不变，端口跳跃自动跟随)"
+yellow "6：仅重置本地IP订阅链接路径"
+yellow "7：设置定时自动重置"
+yellow "8：设置泄露检测 (一段时间内源IP数量超过阈值时，TG通知或自动重置)"
+yellow "0：返回主菜单"
+readp "请选择【0-8】：" menu
+case "$menu" in
+1 ) sbresetgo all;;
+2 ) red "注意：请确保VPS后台防火墙已开放全部端口" && sbresetgo full;;
+3 ) sbresetgo uuid,path;;
+4 ) sbresetgo reality;;
+5 ) red "注意：请确保VPS后台防火墙已开放全部端口" && sbresetgo ports;;
+6 ) sbresetgo subtoken;;
+7 ) yellow "1：每天04:00自动重置 (选项1的项目)"
+yellow "2：每周一04:00自动重置 (选项1的项目)"
+yellow "3：关闭定时重置"
+readp "请选择【1-3】：" sel
+case "$sel" in
+1 ) $sbag schedule daily all >/dev/null && green "已设置每天04:00自动重置";;
+2 ) $sbag schedule weekly all >/dev/null && green "已设置每周一04:00自动重置";;
+3 ) $sbag schedule off >/dev/null && green "已关闭定时重置";;
+esac
+yellow "提示：设置TG推送(主菜单3-5)后，重置后的新节点会自动推送到TG";;
+8 ) $sbag leakconf
+yellow "1：开启泄露检测"
+yellow "2：关闭泄露检测"
+yellow "3：立即检测一次"
+readp "请选择【1-3】：" sel
+if [ "$sel" = "1" ]; then
+readp "统计最近几小时内的源IP (回车默认24)：" hours
+readp "不同源IP数量超过多少视为泄露 (回车默认10)：" thr
+readp "超过阈值时：1、仅TG通知 (回车默认)  2、自动重置参数并TG推送新节点：" act
+[ "$act" = "2" ] && act=reset || act=notify
+$sbag leakconf --enabled 1 --hours "${hours:-24}" --threshold "${thr:-10}" --action "$act" --items all >/dev/null && green "泄露检测已开启，每小时检测一次"
+$sbag logstatus | grep -q '"enabled": true' || yellow "连接日志未开启，请在主菜单17开启，否则无法检测"
+elif [ "$sel" = "2" ]; then
+$sbag leakconf --enabled 0 >/dev/null && green "泄露检测已关闭"
+elif [ "$sel" = "3" ]; then
+$sbag leakcheck
+fi;;
+* ) sb;;
+esac
+sbpause && sbresetmenu
+}
+
+sbapimenu(){
+sbactive
+sbagentchk || return
+echo
+green "API管理：配合 sing-box-yg-worker (Cloudflare Worker) 网页面板，统一管理多台服务器"
+green "通信使用 AES-256 + HMAC 签名加密，带防重放校验；未授权请求一律返回404"
+if [[ -f /etc/s-box/sbapi.json ]]; then
+if command -v apk >/dev/null 2>&1; then
+rc-service sbagent status 2>/dev/null | grep -q started && apist="${green}运行中${plain}" || apist="${red}未运行${plain}"
+else
+systemctl is-active sbagent >/dev/null 2>&1 && apist="${green}运行中${plain}" || apist="${red}未运行${plain}"
+fi
+else
+apist="${yellow}未安装${plain}"
+fi
+echo -e "API服务状态：$apist"
+echo
+yellow "1：安装/重启API服务 (随机端口与密钥)"
+yellow "2：查看对接信息 (复制到Worker面板的「添加服务器」)"
+yellow "3：更换API密钥Token"
+yellow "4：更换API端口"
+yellow "5：卸载API服务"
+yellow "0：返回主菜单"
+readp "请选择【0-5】：" menu
+case "$menu" in
+1 ) $sbag apiinstall >/dev/null && green "API服务已启动" && sbapishow;;
+2 ) sbapishow;;
+3 ) $sbag apiinstall --regen >/dev/null && green "API密钥已更换，请同步更新Worker面板中的服务器配置" && sbapishow;;
+4 ) readp "输入新的API端口 (回车随机)：" apiport
+if [ -z "$apiport" ]; then
+apiport=$(shuf -i 10000-65535 -n 1)
+fi
+$sbag apiinstall --port "$apiport" >/dev/null && green "API端口已更换" && sbapishow;;
+5 ) $sbag apiuninstall >/dev/null && green "API服务已卸载";;
+* ) sb;;
+esac
+sbpause && sbapimenu
+}
+
+sbapishow(){
+if [[ ! -f /etc/s-box/sbapi.json ]]; then
+yellow "API服务未安装" && return
+fi
+echo
+green "对接信息如下 (整段JSON粘贴到Worker面板「添加服务器」即可)："
+blue "$($sbag apiinfo | python3 -c 'import json,sys;d=json.load(sys.stdin);d.pop("running",None);print(json.dumps(d,ensure_ascii=False))')"
+echo
+yellow "1、请确保VPS后台防火墙已开放该TCP端口：$(python3 -c 'import json;print(json.load(open("/etc/s-box/sbapi.json"))["port"])')"
+yellow "2、Token等同于服务器管理权限，切勿泄露；如已泄露请选择3更换"
+yellow "3、如果本机IP为IPV6，Worker也可直接连接"
 }
 
 sbsm(){
@@ -4298,6 +4519,15 @@ blue "推荐甬哥新品：ArgoSBX一键无交互小钢炮脚本"
 blue "ArgoSBX项目地址：https://github.com/yonggekkk/argosbx"
 echo
 }
+
+# 非交互入口：sbagent 重置参数后调用，重新生成分享链接/订阅并推送 Gitlab、TG
+if [[ "$1" == "--share" ]]; then
+sbactive
+sbshare > /dev/null 2>&1
+[[ -d /etc/s-box/.git ]] && gitlabsubgo > /dev/null 2>&1
+[[ -f /etc/s-box/sbtg.sh ]] && bash /etc/s-box/sbtg.sh > /dev/null 2>&1
+exit 0
+fi
 
 clear
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" 
@@ -4334,18 +4564,21 @@ green "14. 添加 WARP-plus-Socks5 代理模式 【本地Warp/多地区Psiphon-V
 green "15. 更换IP刷新本地IP、调整IPV4/IPV6配置输出"
 white "----------------------------------------------------------------------------------"
 green "16. Sing-box-yg脚本使用说明书"
+green "17. 连接访问日志 【查看源IP/访问链接/统计/探测记录】"
+green "18. 防泄露参数重置 【UUID/Reality密钥/端口/订阅路径，定时重置/泄露检测】"
+green "19. API管理 【对接Cloudflare Worker网页面板，多服务器统一管理】"
 white "----------------------------------------------------------------------------------"
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
-latestV=$(curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version | awk -F "更新内容" '{print $1}' | head -n 1)
+latestV=$(curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1)
 if [ -f /etc/s-box/v ]; then
 if [ "$insV" = "$latestV" ]; then
 echo -e "当前 Sing-box-yg 脚本最新版：${bblue}${insV}${plain} (已安装)"
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${insV}${plain}"
 echo -e "检测到最新 Sing-box-yg 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
-echo -e "${yellow}$(curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/version)${plain}"
+echo -e "${yellow}$(curl -sL ${sbrepo}/version)${plain}"
 fi
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${latestV}${plain}"
@@ -4446,7 +4679,7 @@ showprotocol
 fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
-readp "请输入数字【0-16】:" Input
+readp "请输入数字【0-19】:" Input
 case "$Input" in  
  1 ) instsllsingbox;;
  2 ) unins;;
@@ -4464,5 +4697,8 @@ case "$Input" in
 14 ) inssbwpph;;
 15 ) wgcfgo && sbshare;;
 16 ) sbsm;;
+17 ) sbaccesslog;;
+18 ) sbresetmenu;;
+19 ) sbapimenu;;
  * ) exit 
 esac

@@ -43,13 +43,7 @@ exec(changeportCommands, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) 
         console.error('stderr:', stderr);
         if (err) {
             console.error('Execution error:', err);
-            return res.status(500).send(`错误：${stderr || stdout}`);
         }
-        if (stderr) {
-            console.error('stderr output:', stderr);
-            return res.status(500).send(`stderr: ${stderr}`);
-        }
-        res.type('text').send(stdout);
     });
 }
 app.get("/rp", (req, res) => {

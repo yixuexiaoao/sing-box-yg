@@ -44,11 +44,11 @@
 ### VPS专用一键脚本如下：快捷方式：```sb```
 
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/sb.sh)
 ```
 或者
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/sb.sh)
 ```
 
 一键快捷命令现实本地IP订阅：```printf '3\n8\n1\n订阅密码' | sb```
@@ -58,6 +58,25 @@ bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.
 一键快捷命令现实Argo固定隧道：```printf '3\n3\n2\n1\n固定密钥\n固定域名' | sb```
 
 一键快捷命令现实域名分流：```printf '5\n2\n1\n后缀域名1 后缀域名2' | sb```
+
+
+### 新增功能（本仓库扩展）：连接访问日志 / 防泄露参数重置 / 多服务器Web管理面板
+
+* **主菜单17 连接访问日志**：记录并查看每个连接的源IP:端口、协议、访问目标(含嗅探域名)、出站通道；按源IP/访问目标统计；查询指定IP或网址；查看认证失败与主动探测记录；查看当前在线客户端IP。新安装默认开启，日志 `/etc/s-box/sing-box.log` 超过10MB自动轮转
+
+* **主菜单18 防泄露参数重置**：节点或订阅链接泄露后，一键重置 UUID(密码)+Vmess路径、Reality密钥与short_id、本地订阅路径，可选重置Vless/Hy2/Tuic/Anytls端口（端口跳跃自动跟随）。重置前自动备份、`sing-box check` 校验失败自动回滚；重置后自动更新本地订阅、Gitlab订阅并推送TG。支持定时自动重置与泄露检测（N小时内源IP数超过阈值时TG通知或自动重置）
+
+* **主菜单19 API管理**：在VPS上启动加密管理API，配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 部署到 Cloudflare Workers，在网页上统一管理多台服务器：查看源IP/访问记录与统计、重置参数、查看节点链接、重启、定时重置与泄露检测设置
+
+* 命令行用法（`/etc/s-box/sbagent.py`）：
+```
+python3 /etc/s-box/sbagent.py logs --limit 100 --ip 1.2.3.4   # 访问记录
+python3 /etc/s-box/sbagent.py stats --hours 24                  # 源IP/访问目标统计
+python3 /etc/s-box/sbagent.py reset all                         # 一键重置(UUID+路径+Reality+订阅路径)
+python3 /etc/s-box/sbagent.py reset full                        # 同上并重置端口
+```
+
+* 详细变更见 [CHANGELOG.md](CHANGELOG.md)
 
 
 ### Sing-box-yg脚本界面预览图（注：相关参数随意填写，仅供围观）
