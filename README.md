@@ -16,7 +16,7 @@
 
 * 支持纯IPV6、纯IPV4、双栈VPS，支持amd与arm架构，支持alpine系统，推荐使用最新的Ubuntu系统
 
-* 小白简单模式：无需域名证书，回车三次就安装完成，复制、扫描你要的节点配置
+* 小白简单模式：无需域名证书，一路回车即可安装完成，完成后直接列出全部节点链接；二维码在主菜单9查看
 
 #### 相关说明及注意点请查看[甬哥博客说明与Sing-box视频教程](https://ygkkk.blogspot.com/2023/10/sing-box-yg.html)
 
@@ -60,27 +60,36 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 一键快捷命令现实域名分流：```printf '5\n2\n1\n后缀域名1 后缀域名2' | sb```
 
 
-### 新增功能（本仓库扩展）：连接访问日志 / 防泄露参数重置 / 多服务器Web管理面板
+### 新增功能（本仓库扩展）：连接访问日志 / 流量统计 / 防泄露参数重置 / 多服务器Web管理面板
 
-* **主菜单17 连接访问日志**：记录并查看每个连接的源IP:端口、协议、访问目标(含嗅探域名)、出站通道；按源IP/访问目标统计；查询指定IP或网址；查看认证失败与主动探测记录；查看当前在线客户端IP。新安装默认开启，日志 `/etc/s-box/sing-box.log` 超过10MB自动轮转
+#### 一键安装流程
+1. 是否开放端口、关闭防火墙（回车默认执行）
+2. **零、是否开启API管理**（回车默认不开启）：开启时设置API端口、权限级别（完全管理 / 只读+节点链接 / 仅只读）、可选IP白名单、是否开启流量统计；Sing-box 安装完成后自动启用，若与协议端口冲突会自动换端口
+3. 一、选择内核版本；二、证书（自签 / Acme域名证书）
+4. **三、协议端口**：
+   * 1：全部随机（回车默认）
+   * 2：**一次输入全部端口**，按 `Vless Vmess Hy2 Tuic Anytls` 顺序用空格分隔，如 `20001 8080 20003 20004 20005`；某项填 `0` 表示随机；逐项检查格式、占用与重复，有误会提示重新输入
+   * 3：逐个协议输入
+5. 自动生成 UUID、Reality 密钥、WARP 账户并启动
+6. **完成后只列出全部节点链接、聚合节点与 API 对接信息**（不再刷屏显示二维码）；节点二维码、Mihomo/Sing-box 客户端配置在 **主菜单 9** 查看
 
-* **主菜单18 防泄露参数重置**：节点或订阅链接泄露后，一键重置 UUID(密码)+Vmess路径、Reality密钥与short_id、本地订阅路径，可选重置Vless/Hy2/Tuic/Anytls端口（端口跳跃自动跟随）。重置前自动备份、`sing-box check` 校验失败自动回滚；重置后自动更新本地订阅、Gitlab订阅并推送TG。支持定时自动重置与泄露检测（N小时内源IP数超过阈值时TG通知或自动重置）
+#### 菜单功能
+* **主菜单17 连接访问日志与流量统计**：每个连接的源IP:端口、协议、访问目标(含嗅探域名)、出站通道；按源IP/访问目标统计；认证失败与主动探测记录；在线客户端IP；**流量统计**按源IP/访问地址/主域名/日期/小时/月份/协议统计，可选时间段与筛选；日志 gzip 压缩归档、保留份数/天数、按时间段删除
+* **主菜单18 防泄露参数重置**：节点或订阅链接泄露后，一键重置 UUID(密码)+Vmess路径、Reality密钥与short_id、本地订阅路径，可选重置Vless/Hy2/Tuic/Anytls端口（端口跳跃自动跟随）。重置前自动备份、`sing-box check` 校验失败自动回滚；重置后自动更新本地订阅、Gitlab订阅并推送TG，Worker 面板中的订阅也会自动同步。支持定时自动重置与泄露检测
+* **主菜单19 API管理**：安装/重启、查看对接信息、更换Token/端口、**权限级别、IP白名单、重置最小间隔、API审计日志**；配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 部署到 Cloudflare Workers，在网页上统一管理多台服务器（分组、流量统计与IP归属地、流量周期与配额、订阅生成、审计与TG通知）
 
-* **一键安装第六步**：可选开启API（端口、权限级别、IP白名单、流量统计），完成后直接显示面板对接信息
+#### 安全
+* API 通信 AES-256 加密 + HMAC 签名，防重放；未通过校验的请求一律返回 404
+* **权限、IP白名单、Token 只能在 VPS 上修改**，API 中没有修改它们或执行命令的接口，Token 泄露也无法控制 VPS；认证失败10次封禁1小时；两次重置的最小间隔；审计日志
+* 流量统计使用 sing-box 自带的 Clash API，只监听 127.0.0.1 并使用随机密钥；`/etc/s-box`（含私钥、Token）权限为 700
 
-* **主菜单17 流量统计**：按源IP/访问地址/日期/小时/协议统计流量，可按时间段查询；日志gzip压缩归档、保留天数、按时间段删除
-
-* **API 安全**：权限分级（只读/查看节点链接/管理），权限、IP白名单、Token 只能在VPS上修改，Token 泄露也无法控制VPS；认证失败自动封禁、重置频率限制、审计日志
-
-* **主菜单19 API管理**：在VPS上启动加密管理API，配合 [sing-box-yg-worker](https://github.com/yixuexiaoao/sing-box-yg-worker) 部署到 Cloudflare Workers，在网页上统一管理多台服务器：查看源IP/访问记录与统计、重置参数、查看节点链接、重启、定时重置与泄露检测设置
-
-* 命令行用法（`/etc/s-box/sbagent.py`）：
+#### 命令行（`/etc/s-box/sbagent.py`）
 ```
 python3 /etc/s-box/sbagent.py logs --limit 100 --ip 1.2.3.4   # 访问记录
 python3 /etc/s-box/sbagent.py stats --hours 24                  # 源IP/访问目标统计
+python3 /etc/s-box/sbagent.py traffic --by host --start 2026-11-01 --ip 1.2.3.4   # 流量统计
 python3 /etc/s-box/sbagent.py reset all                         # 一键重置(UUID+路径+Reality+订阅路径)
 python3 /etc/s-box/sbagent.py reset full                        # 同上并重置端口
-python3 /etc/s-box/sbagent.py traffic --by host --start 2026-11-01 --ip 1.2.3.4   # 流量统计
 python3 /etc/s-box/sbagent.py logprune --days 30                # 删除30天以前的日志
 python3 /etc/s-box/sbagent.py apiset --perms read,links          # 修改API权限（仅本机）
 ```

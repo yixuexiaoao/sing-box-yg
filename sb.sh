@@ -305,7 +305,7 @@ certificatep_an='/etc/s-box/private.key'
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "二、生成并设置相关证书"
 echo
-blue "自动生成bing自签证书中……" && sleep 2
+blue "自动生成bing自签证书中……"
 openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key
 openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com"
 echo
@@ -345,6 +345,43 @@ fi
 fi
 }
 
+# 一次输入全部协议端口：顺序 Vless Vmess Hy2 Tuic [Anytls]，空格分隔；0 或留空表示随机
+sbportsline(){
+local names=("Vless-reality" "Vmess-ws" "Hysteria2" "Tuic5") line arr res i v bad
+[[ "$sbnh" != "1.10" ]] && names+=("Anytls")
+while :; do
+echo
+yellow "按顺序输入 ${names[*]} 的端口，用空格分隔；某项填 0 表示随机端口"
+yellow "例：20001 8080 20003 20004$([[ ${#names[@]} -eq 5 ]] && echo ' 20005')   (Vmess 若要使用CDN优选，可填 8080/8880/2052/2082/2086/2095，开启TLS时填 443/8443/2053/2083/2087/2096)"
+readp "端口：" line || exit 1
+read -ra arr <<< "${line//,/ }"
+if (( ${#arr[@]} > ${#names[@]} )); then
+red "输入了 ${#arr[@]} 个端口，多于协议数 ${#names[@]}" && continue
+fi
+res=() bad=
+for ((i=0; i<${#names[@]}; i++)); do
+v=${arr[$i]:-0}
+if [[ $v == 0 ]]; then
+v=$(shuf -i 10000-65535 -n 1)
+while sbportbusy "$v" || [[ " ${res[*]} " == *" $v "* ]]; do v=$(shuf -i 10000-65535 -n 1); done
+elif ! sbportok "$v"; then
+bad="${names[$i]} 端口格式错误：$v (需为1-65535的数字)"; break
+else
+v=$((10#$v))
+if sbportbusy "$v"; then bad="${names[$i]} 端口 $v 已被占用"; break; fi
+if [[ " ${res[*]} " == *" $v "* ]]; then bad="端口 $v 重复"; break; fi
+fi
+res+=("$v")
+done
+[[ -n $bad ]] && red "$bad，请重新输入" && continue
+break
+done
+port_vl_re=${res[0]}
+port_vm_ws=${res[1]}
+port_hy2=${res[2]}
+port_tu=${res[3]}
+port_an=${res[4]:-$(shuf -i 10000-65535 -n 1)}
+}
 sbportok(){
 [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
@@ -367,7 +404,7 @@ fi
 break
 done
 port=$((10#$port))
-blue "确认的端口：$port" && sleep 2
+blue "确认的端口：$port"
 }
 
 vlport(){
@@ -400,8 +437,9 @@ insport(){
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "三、设置各个协议端口"
 yellow "1：自动生成每个协议的随机端口 (10000-65535范围内)，回车默认。请确保VPS后台已开放所有端口"
-yellow "2：自定义每个协议端口。请确保VPS后台已开放指定的端口"
-readp "请输入【1-2】：" port
+yellow "2：自定义端口：按顺序一次输入全部协议端口，用空格分隔 (推荐)"
+yellow "3：自定义端口：逐个协议输入"
+readp "请输入【1-3】：" port
 if [ -z "$port" ] || [ "$port" = "1" ] ; then
 ports=()
 for i in {1..5}; do
@@ -437,6 +475,8 @@ port_vm_ws=${numbers[$RANDOM % ${#numbers[@]}]}
 done
 echo
 blue "根据Vmess-ws协议是否启用TLS，随机指定支持CDN优选IP的标准端口：$port_vm_ws"
+elif [ "$port" = "2" ]; then
+sbportsline
 else
 vlport && vmport && hy2port && tu5port
 if [[ "$sbnh" != "1.10" ]]; then
@@ -2580,12 +2620,13 @@ if [[ -f '/etc/systemd/system/sing-box.service' ]]; then
 red "已安装Sing-box服务，无法再次安装" && exit
 fi
 mkdir -p /etc/s-box
+chmod 700 /etc/s-box
 v6
 openyn
+sbapiask
 inssb
 inscertificate
 insport
-sleep 2
 echo
 blue "Vless-reality相关key与id将自动生成……"
 key_pair=$(/etc/s-box/sing-box generate reality-keypair)
@@ -2593,10 +2634,9 @@ private_key=$(echo "$key_pair" | awk '/PrivateKey/ {print $2}' | tr -d '"')
 public_key=$(echo "$key_pair" | awk '/PublicKey/ {print $2}' | tr -d '"')
 echo "$public_key" > /etc/s-box/public.key
 short_id=$(/etc/s-box/sing-box generate rand --hex 4)
-wget -q -O /root/geoip.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db
-wget -q -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db
+sbgeodb
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-green "五、自动生成warp-wireguard出站账户" && sleep 2
+green "五、自动生成warp-wireguard出站账户"
 warpwg
 inssbjsonser
 sbservice
@@ -2607,11 +2647,44 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 lnsb && blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
 echo
 wgcfgo
-sbshare
-sbapiwizard
-red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-blue "可选择9，刷新并显示所有协议配置及分享链接"
-red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+green "正在生成节点链接与订阅配置……"
+sbshare > /dev/null 2>&1
+sbapido
+sbresult
+}
+
+# 仅 1.10 内核的 geosite 分流需要规则库（工作目录 /root），后台下载不阻塞安装
+sbgeodb(){
+if [[ "$sbnh" == "1.10" && ! -s /root/geosite.db ]]; then
+(wget -q -O /root/geoip.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db
+wget -q -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db) >/dev/null 2>&1 &
+fi
+}
+
+# 安装完成：只列出节点链接、订阅地址与 API 对接信息（二维码与完整配置在主菜单 9 查看）
+sbresult(){
+local f n
+echo
+red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+green "安装完成，全部节点链接如下："
+for f in vl_reality:Vless-reality vm_ws:Vmess-ws vm_ws_tls:Vmess-ws-tls vm_ws_argols:Vmess-Argo临时 vm_ws_argogd:Vmess-Argo固定 hy2:Hysteria2 tuic5:Tuic5 an:Anytls; do
+n=${f#*:}; f=/etc/s-box/${f%%:*}.txt
+if [[ -s $f ]]; then
+echo
+blue "【$n】"
+echo -e "${yellow}$(cat "$f")${plain}"
+fi
+done
+if [[ -s /etc/s-box/jhdy.txt ]]; then
+echo
+blue "【聚合节点 (可直接导入 v2rayN/NekoBox)】"
+echo -e "${yellow}$(base64 -w 0 < /etc/s-box/jhdy.txt 2>/dev/null)${plain}"
+fi
+[[ -f /etc/s-box/sbapi.json ]] && sbapishow
+echo
+red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+blue "节点二维码、Mihomo/Sing-box 客户端配置：主菜单 9 → 1/2 查看；本地IP订阅：主菜单 3 → 8 设置"
+red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 }
 
@@ -3976,6 +4049,7 @@ chown root:root /etc/s-box/sing-box
 chmod +x /etc/s-box/sing-box
 sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
 [[ "$sbnh" == "1.10" ]] && num=10 || num=11
+sbgeodb
 rm -rf /etc/s-box/sb.json
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 restartsb && sbshare > /dev/null 2>&1
@@ -4402,6 +4476,7 @@ if [[ ! -s /etc/s-box/sbagent.py ]]; then
 red "sbagent.py下载失败，请检查VPS能否访问Github" && return 1
 fi
 sbag="env PYTHONIOENCODING=utf-8 python3 /etc/s-box/sbagent.py"
+chmod 700 /etc/s-box 2>/dev/null
 }
 
 sbpause(){
@@ -4570,15 +4645,15 @@ esac
 sbpause && sbresetmenu
 }
 
-sbapiwizard(){
+sbapiask(){
+sbapi_on=
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-green "六、是否开启API管理？"
+green "零、是否开启API管理？"
 blue "配合 sing-box-yg-worker (Cloudflare Worker) 网页面板，统一管理多台服务器：访问日志、流量统计、一键重置参数、订阅等"
 yellow "1：开启"
 yellow "2：暂不开启 (回车默认，以后可在主菜单19开启)"
 readp "请选择【1-2】：" menu
 [ "$menu" = "1" ] || return 0
-sbagentchk || return 0
 port=
 readp "\n设置API端口 (TCP，回车跳过为10000-65535之间的随机端口)：" port
 chooseport
@@ -4598,15 +4673,26 @@ echo
 yellow "可选：只允许指定IP/网段访问API，多个用逗号分隔 (回车不限制)"
 yellow "注意：Cloudflare Worker 的出口IP不固定，填写后Worker面板可能无法连接，一般请直接回车"
 readp "API访问IP白名单：" apiallow
-readp "是否开启流量统计 (按日期/IP/访问地址统计流量)？1、开启 (回车默认)  2、不开启：" sel
+readp "是否开启流量统计 (按日期/IP/访问地址统计流量)？1、开启 (回车默认)  2、不开启：" apitraffic
+sbapi_on=1
+green "API设置已记录，将在Sing-box安装完成后启用"
+}
+
+sbapido(){
+[[ -n $sbapi_on ]] || return 0
+sbagentchk || return 0
+# 询问时协议端口尚未确定：若与协议端口冲突则自动换一个
+if [[ " $port_vl_re $port_vm_ws $port_hy2 $port_tu $port_an " == *" $apiport "* ]] || sbportbusy "$apiport"; then
+apiport=$(shuf -i 10000-65535 -n 1)
+while sbportbusy "$apiport"; do apiport=$(shuf -i 10000-65535 -n 1); done
+yellow "API端口与协议端口冲突，已改为：$apiport"
+fi
 if ! $sbag apiinstall --port "$apiport" --perms "$apiperms" --allow "$apiallow" >/dev/null; then
 red "API服务安装失败，可稍后在主菜单19重试" && return 0
 fi
-if [ "$sel" != "2" ]; then
-$sbag trafficon >/dev/null 2>&1 && green "流量统计已开启" || yellow "流量统计开启失败，可稍后在主菜单17重试"
+if [ "$apitraffic" != "2" ]; then
+$sbag trafficon >/dev/null 2>&1 || yellow "流量统计开启失败，可稍后在主菜单17重试"
 fi
-green "API服务已开启"
-sbapishow
 }
 
 sbapimenu(){

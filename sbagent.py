@@ -34,7 +34,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
 SB_BIN = os.environ.get("SB_BIN", os.path.join(SB_DIR, "sing-box"))
 SB_CMD = os.environ.get("SB_CMD", "/usr/bin/sb")
@@ -1316,6 +1316,11 @@ TRAFFIC_GROUPS = {
 }
 
 
+def utc_offset():
+    """服务器本地时间相对 UTC 的秒数（含夏令时）。"""
+    return -time.altzone if time.localtime().tm_isdst > 0 else -time.timezone
+
+
 def traffic_range(p):
     end = parse_when(p.get("end"), time.time())
     if p.get("hours") not in (None, ""):
@@ -1372,6 +1377,7 @@ def query_traffic(p):
         "matched": {"up": m[0] or 0, "down": m[1] or 0, "conns": m[2] or 0},
         "total": {"up": t[0] or 0, "down": t[1] or 0},
         "nic": {"rx": n[0] or 0, "tx": n[1] or 0, "since": fmt_ts(n0[0]) if n0 and n0[0] else ""},
+        "tzoff": utc_offset(),  # 日期/小时分组键使用服务器本地时间，面板据此换算
         "collector": COLLECTOR.error if COLLECTOR is not None else None,
     }
 
