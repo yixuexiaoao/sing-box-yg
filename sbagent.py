@@ -34,7 +34,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
 SB_BIN = os.environ.get("SB_BIN", os.path.join(SB_DIR, "sing-box"))
 SB_CMD = os.environ.get("SB_CMD", "/usr/bin/sb")
@@ -419,7 +419,7 @@ def rec_host(r):
     return split_hostport(rec_target(r))[0]
 
 
-def filter_recs(recs, hours=None, ip=None, q=None, proto=None, only_err=False, hide_local=False):
+def filter_recs(recs, hours=None, ip=None, q=None, proto=None, only_err=False, hide_local=False, ip_exact=None):
     since = time.time() - float(hours) * 3600 if hours else 0
     q = (q or "").lower()
     out = []
@@ -427,6 +427,8 @@ def filter_recs(recs, hours=None, ip=None, q=None, proto=None, only_err=False, h
         if since and r["t"] < since:
             continue
         if ip and ip not in r["src"]:
+            continue
+        if ip_exact and r["src"] != ip_exact:
             continue
         if proto and r.get("proto") != proto:
             continue
@@ -453,7 +455,7 @@ def log_info():
 def query_logs(p):
     recs = all_records()
     sel = filter_recs(recs, p.get("hours"), p.get("ip"), p.get("q"), p.get("proto"),
-                      bool(p.get("err")), bool(p.get("hidelocal")))
+                      bool(p.get("err")), bool(p.get("hidelocal")), p.get("ipx"))
     limit = max(1, min(int(p.get("limit") or 200), 5000))
     sel = sel[-limit:][::-1]
     for r in sel:
@@ -932,9 +934,10 @@ def do_reset(items, regen=True):
             changed["subtoken"] = newtok
     _keep_backups(os.path.join(SB_DIR, "backup"), 10)
     svc_restart("sing-box")
-    if regen and os.path.exists(SB_CMD):
+    share_cmd = os.environ.get("SB_SHARE_CMD")  # 测试用：替换 sb --share
+    if regen and (share_cmd or os.path.exists(SB_CMD)):
         # 由 sb.sh 重新生成分享链接/订阅文件，并推送 Gitlab 与 TG（已设置时）
-        runs("cd /root && bash %s --share >/dev/null 2>&1" % SB_CMD, timeout=240, shell=True)
+        runs(share_cmd or "cd /root && bash %s --share >/dev/null 2>&1" % SB_CMD, timeout=240, shell=True)
     entry = {"time": fmt_ts(time.time()), "items": sorted(items), "changed": sorted(changed)}
     with open(RESET_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -1103,6 +1106,36 @@ def set_traffic(on):
     return {"enabled": traffic_enabled()}
 
 
+def nic_iface():
+    """默认路由所在网卡；取不到时返回 None（则汇总除虚拟/隧道网卡外的全部网卡）。"""
+    for line in read("/proc/net/route").splitlines()[1:]:
+        f = line.split()
+        if len(f) > 2 and f[1] == "00000000":
+            return f[0]
+    for line in read("/proc/net/ipv6_route").splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[0] == "0" * 32 and f[1] == "00" and f[9] != "lo":
+            return f[9]
+    return None
+
+
+VIRTUAL_NIC = ("lo", "wg", "warp", "tun", "tap", "docker", "veth", "br-", "virbr", "sing", "utun", "cloudflared")
+
+
+def read_nic():
+    """返回 {网卡: (rx_bytes, tx_bytes)}，只含默认路由网卡（避免 WARP/隧道重复计数）。"""
+    out = {}
+    for line in read("/proc/net/dev").splitlines()[2:]:
+        name, _, rest = line.partition(":")
+        f = rest.split()
+        if len(f) >= 9:
+            out[name.strip()] = (int(f[0]), int(f[8]))
+    main = nic_iface()
+    if main and main in out:
+        return {main: out[main]}
+    return {k: v for k, v in out.items() if not k.startswith(VIRTUAL_NIC)}
+
+
 def db_connect():
     if sqlite3 is None:
         raise RuntimeError("当前 python3 缺少 sqlite3 模块")
@@ -1111,6 +1144,8 @@ def db_connect():
                 " up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, conns INTEGER DEFAULT 0,"
                 " PRIMARY KEY(hour, src, host, inbound, outbound))")
     con.execute("CREATE TABLE IF NOT EXISTS total(hour INTEGER PRIMARY KEY, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0)")
+    con.execute("CREATE TABLE IF NOT EXISTS nic(hour INTEGER PRIMARY KEY, rx INTEGER DEFAULT 0, tx INTEGER DEFAULT 0)")
+    con.create_function("root_domain", 1, root_domain)
     con.execute("CREATE INDEX IF NOT EXISTS idx_traffic_src ON traffic(src)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_traffic_host ON traffic(host)")
     return con
@@ -1129,6 +1164,9 @@ class TrafficCollector(threading.Thread):
         self.totals = {}         # hour -> [up, down]
         self.last_flush = time.time()
         self.error = ""
+        self.nic_prev = None     # 网卡计数 {iface: (rx, tx)}
+        self.nic = {}            # hour -> [rx, tx]
+        self.last_nic = 0
 
     def fetch(self, conf):
         req = urllib.request.Request("http://127.0.0.1:%d/connections" % conf["port"],
@@ -1177,6 +1215,21 @@ class TrafficCollector(threading.Thread):
             t[1] += gd
             self.tot, self.seen = (up_t, down_t), cur
 
+    def sample_nic(self, cur=None, now=None):
+        cur = read_nic() if cur is None else cur
+        hour = int((now or time.time()) // 3600 * 3600)
+        with self.lock:
+            if self.nic_prev is not None:
+                rx = tx = 0
+                for k, (r, t) in cur.items():
+                    pr, pt = self.nic_prev.get(k, (r, t))
+                    rx += r - pr if r >= pr else r  # 重启或计数器回绕后从头计
+                    tx += t - pt if t >= pt else t
+                b = self.nic.setdefault(hour, [0, 0])
+                b[0] += rx
+                b[1] += tx
+            self.nic_prev = cur
+
     def _add(self, hour, key, du, dd, conns):
         if not (du or dd or conns):
             return
@@ -1187,10 +1240,10 @@ class TrafficCollector(threading.Thread):
 
     def flush(self):
         with self.lock:
-            buckets, totals = self.buckets, self.totals
-            self.buckets, self.totals = {}, {}
+            buckets, totals, nic = self.buckets, self.totals, self.nic
+            self.buckets, self.totals, self.nic = {}, {}, {}
             self.last_flush = time.time()
-        if not buckets and not totals:
+        if not buckets and not totals and not nic:
             return
         con = db_connect()
         try:
@@ -1202,11 +1255,20 @@ class TrafficCollector(threading.Thread):
                 for h, (u, d) in totals.items():
                     con.execute("INSERT OR IGNORE INTO total(hour) VALUES(?)", (h,))
                     con.execute("UPDATE total SET up=up+?, down=down+? WHERE hour=?", (u, d, h))
+                for h, (r, t) in nic.items():
+                    con.execute("INSERT OR IGNORE INTO nic(hour) VALUES(?)", (h,))
+                    con.execute("UPDATE nic SET rx=rx+?, tx=tx+? WHERE hour=?", (r, t, h))
         finally:
             con.close()
 
     def run(self):
         while True:
+            if time.time() - self.last_nic >= 60:  # 网卡流量每分钟采样，不依赖 Clash API
+                self.last_nic = time.time()
+                try:
+                    self.sample_nic()
+                except Exception as e:
+                    self.error = "nic: %s" % e
             try:
                 conf = traffic_conf()
                 if conf.get("port") and traffic_enabled():
@@ -1229,9 +1291,26 @@ class TrafficCollector(threading.Thread):
 
 COLLECTOR = None  # serve 模式下启用
 
+SLD = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go"}
+
+
+def root_domain(host):
+    """主域名：www.a.example.com -> example.com，a.example.co.uk -> example.co.uk；IP 原样返回。"""
+    h = (host or "").strip(".").lower()
+    if not h or ":" in h or re.match(r"^\d+\.\d+\.\d+\.\d+$", h) or "." not in h:
+        return h
+    parts = h.split(".")
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in SLD:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
 TRAFFIC_GROUPS = {
     "ip": "src", "host": "host", "inbound": "inbound", "outbound": "outbound",
+    "domain": "root_domain(host)",
     "ip_host": "src || ' -> ' || host",
+    "ip_inbound": "src || ' · ' || inbound",
+    "month": "strftime('%Y-%m', hour, 'unixepoch', 'localtime')",
     "day": "strftime('%Y-%m-%d', hour, 'unixepoch', 'localtime')",
     "hour": "strftime('%Y-%m-%d %H:00', hour, 'unixepoch', 'localtime')",
 }
@@ -1253,7 +1332,7 @@ def query_traffic(p):
         COLLECTOR.flush()
     if not os.path.exists(TRAFFIC_DB):
         return {"enabled": traffic_enabled(), "rows": [], "total": {"up": 0, "down": 0},
-                "matched": {"up": 0, "down": 0, "conns": 0}, "range": []}
+                "matched": {"up": 0, "down": 0, "conns": 0}, "nic": {"rx": 0, "tx": 0, "since": ""}, "range": []}
     start, end = traffic_range(p)
     group = p.get("group") or "ip"
     if group not in TRAFFIC_GROUPS:
@@ -1264,9 +1343,16 @@ def query_traffic(p):
         if v:
             where.append("%s LIKE ? ESCAPE '\\'" % col)
             args.append("%" + v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    for field, col in (("ip_exact", "src"), ("host_exact", "host"), ("domain_exact", "root_domain(host)")):
+        v = str(p.get(field) or "").strip()
+        if v:
+            where.append("%s = ?" % col)
+            args.append(v)
     limit = max(1, min(int(p.get("limit") or 200), 5000))
     key = TRAFFIC_GROUPS[group]
-    order = "k" if group in ("day", "hour") else "(up + down) DESC"
+    # 注意：ORDER BY 表达式中的 up/down 会解析为表字段而非 SUM 别名，必须写聚合函数
+    sort = {"up": "SUM(up) DESC", "down": "SUM(down) DESC", "conns": "SUM(conns) DESC"}.get(p.get("sort"), "SUM(up) + SUM(down) DESC")
+    order = "k" if group in ("day", "hour", "month") else sort
     w = " AND ".join(where)
     con = db_connect()
     try:
@@ -1275,6 +1361,8 @@ def query_traffic(p):
                            % (key, w, order), args + [limit]).fetchall()
         m = con.execute("SELECT SUM(up), SUM(down), SUM(conns) FROM traffic WHERE " + w, args).fetchone()
         t = con.execute("SELECT SUM(up), SUM(down) FROM total WHERE hour >= ? AND hour < ?", (start, end)).fetchone()
+        n = con.execute("SELECT SUM(rx), SUM(tx), MIN(hour) FROM nic WHERE hour >= ? AND hour < ?", (start, end)).fetchone()
+        n0 = con.execute("SELECT MIN(hour) FROM nic").fetchone()
     finally:
         con.close()
     return {
@@ -1283,6 +1371,7 @@ def query_traffic(p):
                   "first": fmt_ts(r[6]), "last": fmt_ts(r[7] + 3599)} for r in rows],
         "matched": {"up": m[0] or 0, "down": m[1] or 0, "conns": m[2] or 0},
         "total": {"up": t[0] or 0, "down": t[1] or 0},
+        "nic": {"rx": n[0] or 0, "tx": n[1] or 0, "since": fmt_ts(n0[0]) if n0 and n0[0] else ""},
         "collector": COLLECTOR.error if COLLECTOR is not None else None,
     }
 
@@ -1302,6 +1391,7 @@ def purge_traffic(p):
         with con:
             n = con.execute("DELETE FROM traffic WHERE hour >= ? AND hour < ?", (start, end)).rowcount
             con.execute("DELETE FROM total WHERE hour >= ? AND hour < ?", (start, end))
+            con.execute("DELETE FROM nic WHERE hour >= ? AND hour < ?", (start, end))
         con.execute("VACUUM")
     finally:
         con.close()
@@ -1417,7 +1507,7 @@ def unseal(env, keys):
 # 注意：没有任何动作可以执行任意命令、修改 API 权限/白名单/Token，这些只能在 VPS 上通过 sb 菜单修改，
 # 即使 Token 泄露，对方也无法借此控制 VPS 或提升权限。
 ACTIONS = {
-    "ping": (None, lambda p: {"pong": True, "agent": VERSION}),
+    "ping": (None, lambda p: {"pong": True, "agent": VERSION, "rev": params_rev()}),
     "status": ("read", status),
     "logs": ("read", query_logs),
     "stats": ("read", query_stats),
@@ -1442,6 +1532,15 @@ ACTIONS = {
     "trafficconf": ("manage", lambda p: traffic_conf(p or None)),
 }
 PERMS = ("read", "links", "manage")
+
+
+def params_rev():
+    """节点参数版本：任一分享链接文件变化（重置/改端口/改域名等）即变化，不含链接内容本身。"""
+    h = hashlib.sha256()
+    for _, fn in LINK_FILES:
+        fid = _file_id(os.path.join(SB_DIR, fn))
+        h.update(repr(fid[2:] if fid else None).encode())
+    return h.hexdigest()[:16]
 MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog"}
 QUIET = {"ping", "status", "logs", "stats", "peers", "rawlog", "traffic", "apilog"}  # 高频只读动作不写审计日志
 
@@ -1555,6 +1654,8 @@ class Api(object):
                     data = fn(params)
             else:
                 data = fn(params)
+            if action == "reset" and "links" not in self.perms and isinstance(data, dict):
+                data = {k: v for k, v in data.items() if k not in ("links", "subs")}
             resp = {"ok": True, "data": data}
         except Exception as e:  # 业务错误加密返回给面板
             resp = {"ok": False, "error": str(e)}

@@ -28,11 +28,13 @@ for n in ("sb10.json", "sb11.json", "sb.json"):
 if os.name == "nt":
     fake = os.path.join(T, "sing-box.bat")
     open(fake, "w").write("@echo off\n"
+                          "if \"%1\"==\"generate\" (echo PrivateKey: PKnew& echo PublicKey: PUBnew& exit /b 0)\n"
                           "if \"%1\"==\"check\" (findstr BADCONF %3 >nul && exit /b 1)\n"
                           "exit /b 0\n")
 else:
     fake = os.path.join(T, "sing-box")
     open(fake, "w").write("#!/bin/sh\n"
+                          "if [ \"$1\" = generate ]; then echo 'PrivateKey: PKnew'; echo 'PublicKey: PUBnew'; exit 0; fi\n"
                           "if [ \"$1\" = check ]; then ! grep -q BADCONF \"$3\"; exit $?; fi\n"
                           "exit 0\n")
     os.chmod(fake, 0o755)
@@ -85,8 +87,38 @@ try:
     A.query_traffic({"group": "src; DROP TABLE traffic"}); check(False, "bad group rejected")
 except ValueError:
     check(True, "bad group rejected (no SQL injection)")
+q = A.query_traffic({"start": H, "end": H + 7200, "group": "ip", "ip_exact": "2.2.2.2"})
+check([r["key"] for r in q["rows"]] == ["2.2.2.2"], "exact ip filter")
+q = A.query_traffic({"start": H, "end": H + 7200, "group": "domain"})
+check({r["key"] for r in q["rows"]} >= {"a.com", "b.com"}, "group by root domain (sqlite udf)")
+# 排序必须按聚合后的合计（多行聚合时按单行字段排序会出错）
+con = A.db_connect()
+with con:
+    for i, (h, u) in enumerate([("small.com", 10), ("big.com", 5), ("big.com", 5), ("big.com", 5), ("mid.com", 12)]):
+        con.execute("INSERT INTO traffic(hour,src,host,inbound,outbound,up,down,conns) VALUES(?,?,?,?,?,?,?,1)", (H + 3600, "9.9.9.%d" % i, h, "x", "y", u, 0))
+con.close()
+q = A.query_traffic({"start": H + 3600, "end": H + 7200, "group": "host", "ip": "9.9.9."})
+check([r["key"] for r in q["rows"]] == ["big.com", "mid.com", "small.com"], "sorted by aggregated total: " + str([r["key"] for r in q["rows"]]))
+q = A.query_traffic({"start": H, "end": H + 7200, "group": "ip", "sort": "conns"})
+check(q["rows"][0]["conns"] >= q["rows"][-1]["conns"], "sort by conns")
+q = A.query_traffic({"start": H, "end": H + 7200, "group": "month"})
+check(len(q["rows"]) == 1 and re.match(r"^\d{4}-\d{2}$", q["rows"][0]["key"]), "group by month")
+q = A.query_traffic({"start": H, "end": H + 7200, "group": "ip_inbound"})
+check(any(" · vless/vless-sb" in r["key"] for r in q["rows"]), "group by ip + protocol")
+# 网卡计数：首次建立基线、增量、重启后计数器归零
+C2 = A.TrafficCollector()
+C2.sample_nic({"eth0": (1000, 500)}, H + 10)
+C2.sample_nic({"eth0": (1600, 900)}, H + 70)
+C2.sample_nic({"eth0": (100, 50)}, H + 130)
+check(C2.nic[H] == [700, 450], "nic deltas incl. counter reset")
+C2.flush()
+q = A.query_traffic({"start": H, "end": H + 7200})
+check(q["nic"]["rx"] == 700 and q["nic"]["tx"] == 450, "nic totals returned by query")
 r = A.purge_traffic({"start": H, "end": H + 3600})
 check(r["removed"] == 3 and A.query_traffic({"start": H, "end": H + 7200})["total"]["up"] == 10, "purge by time range")
+rev1 = A.params_rev()
+open(os.path.join(SB, "vl_reality.txt"), "w").write("vless://new@1.1.1.1:1#x\n")
+check(A.params_rev() != rev1, "params revision changes when link files change")
 
 # ---------------- 2. enable/disable clash api in config
 before = {f: open(os.path.join(SB, f)).read() for f in A.CONF_NAMES}
@@ -162,6 +194,13 @@ c, r = call("reset", {"items": "uuid"})
 check(c == 200 and not r["ok"] and "过于频繁" in r["error"], "reset cooldown enforced")
 c, r = call("trafficpurge", {"days": 1})
 check(c == 200 and r["ok"], "manage action allowed after perms granted")
+c, r = call("ping")
+check(c == 200 and r["data"]["rev"] == A.params_rev(), "ping returns params revision")
+srv.api.reset_interval = 0
+srv.api.perms = {"read", "manage"}
+c, r = call("reset", {"items": "reality"})
+check(c == 200 and r["ok"] and "links" not in r["data"] and "changed" in r["data"], "reset result hides links without links perm")
+srv.api.perms = {"read", "links", "manage"}
 log = A.api_log_read({"lines": 50})["entries"]
 check(any(e["action"] == "links" and not e["ok"] for e in log) and any(e["action"] == "trafficpurge" for e in log)
       and not any(e["action"] == "status" and e["ok"] for e in log), "audit log: denials + mutations, quiet reads skipped")
