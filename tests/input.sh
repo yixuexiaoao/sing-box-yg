@@ -42,4 +42,11 @@ out=$(sbportsline 2>&1 <<< $'1 2 3 4 5
 31001 8080 31003 31004')
 t "ports line: 1.10 core has 4 protocols" "$(echo "$out" | grep -c '多于协议数')" "1"
 (sbportsline < /dev/null > /dev/null 2>&1); t "ports line: EOF exits instead of looping" "$?" "1"
+
+# 返回主菜单（sb）必须替换当前进程：主菜单按 0 退出后，不能再回到调用处继续执行（如「按回车键返回」）
+d=$(mktemp -d); printf 'echo MAIN; exit 0\n' > "$d/main.sh"
+{ sed -n '/^sb(){/,/^}/p' sb.sh | sed "s#/usr/bin/sb#$d/main.sh#g"; printf 'sub(){ echo SUB; sb; echo AFTER; }\nsub; echo AFTER2\n'; } > "$d/sub.sh"
+out=$(timeout 10 bash "$d/sub.sh" 2>&1 | tr '\n' ' ')
+t "back to main menu replaces process (0 exits)" "$out" "SUB MAIN "
+rm -rf "$d"
 echo "FAILS: $fails"; exit $((fails > 0))

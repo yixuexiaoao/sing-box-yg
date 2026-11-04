@@ -37,7 +37,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
@@ -779,7 +779,7 @@ def get_links(_p=None):
         v = read(os.path.join(SB_DIR, fn)).strip()
         if v:
             subs.append({"name": name, "link": v})
-    return {"links": links, "subs": subs}
+    return {"links": links, "subs": subs, "rev": params_rev()}
 
 
 # ---------------------------------------------------------------- 防泄露参数重置
@@ -1684,7 +1684,7 @@ def status(_p=None):
         argo["fixed"] = read(os.path.join(SB_DIR, "sbargoym.log")).strip()
     return {
         "agent": VERSION, "script_version": script_version(), "hostname": socket.gethostname(), "os": osname,
-        "kernel": runs(["uname", "-r"])[1] if has("uname") else "",
+        "kernel": os.uname().release if hasattr(os, "uname") else "",
         "uptime": int(float(up[0])) if up else 0, "load": read("/proc/loadavg").split()[:3], "mem": mem,
         "installed": bool(cfg), "active": svc_active("sing-box") if cfg else False,
         "version": ver.splitlines()[0].replace("sing-box version ", "") if ver else "",

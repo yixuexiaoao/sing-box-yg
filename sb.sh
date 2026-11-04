@@ -3,6 +3,13 @@ export LANG=en_US.UTF-8
 # 修改 crontab 用的临时文件：随机文件名，避免固定路径 /tmp/crontab.tmp 被本地用户预先放置符号链接
 sbcron=$(mktemp /tmp/sbcron.XXXXXXXX 2>/dev/null || mktemp)
 trap 'rm -f "$sbcron"' EXIT
+# 返回主菜单：用新脚本替换当前进程（而不是启动子进程）。
+# 原先 `sb` 会启动一个子进程，在主菜单按 0 退出后又回到父进程，继续执行调用处后面的代码（如「按回车键返回」）
+sb(){
+rm -f "$sbcron"; [[ -n $sbpre ]] && rm -rf "$sbpre"
+if [[ -f /usr/bin/sb ]]; then exec bash /usr/bin/sb; elif [[ -f $0 ]]; then exec bash "$0"; fi
+exit 0
+}
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
