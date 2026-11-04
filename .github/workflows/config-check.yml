@@ -182,6 +182,18 @@ jobs:
         run: python3 tests/test_sbagent.py
       - name: system DNS (NAT64) logic
         run: bash tests/dns.sh
+      - name: core download / verify / replace (local archives)
+        run: bash tests/core.sh
+      - name: core download from GitHub (sbcorelatest + sbcorefetch, as used by install and menu 8)
+        run: |
+          src=$(mktemp)
+          { sed -n '/^red(){/p;/^yellow(){/p' sb.sh; sed -n '/^sbcorevalid(){/p;/^sbcorelatest(){/,/^}/p;/^sbcorefetch(){/,/^}/p;/^lapre(){/,/^}/p' sb.sh; } > "$src"
+          D=$(mktemp -d)
+          bash -c "source $src; cpu=amd64; SBCORE_DIR=$D; SBCORE_QUIET=-sS
+            v=\$(sbcorelatest) && echo \"latest: \$v\" || exit 1
+            b=\$(sbcorefetch \"\$v\") && \"\$b\" version | head -n1 || exit 1
+            b=\$(sbcorefetch 1.10.7) && \"\$b\" version | grep -q 1.10.7 || exit 1
+            if sbcorefetch 1.0.99 >/dev/null; then echo '::error title=core::nonexistent version reported as downloaded'; exit 1; fi"
       - name: open chosen ports in the active firewall (real ufw, then real iptables)
         run: |
           src=$(mktemp)

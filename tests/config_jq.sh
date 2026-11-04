@@ -19,5 +19,17 @@ for i in 1 2 3 4 5 6; do
 t "rules[$i].domain_suffix" "${sbfl[$(( (i-1)*2 ))]}" "$(j ".route.rules[$i].domain_suffix | join(\" \")")"
 t "rules[$i].geosite" "${sbfl[$(( (i-1)*2+1 ))]}" "$(j ".route.rules[$i].geosite | join(\" \")")"
 done
+
+# result_vl_vm_hy_tu：直接取 sb.sh 中的合并 jq 表达式，逐项与原来的单独调用比较
+expr=$(sed -n "/^result_vl_vm_hy_tu(){/,/^}/{s/.*| jq -r '\(.*\)' 2>\/dev\/null)\$/\1/p}" "$(dirname "$0")/../sb.sh" | head -n 1)
+t "merged expression found" "$([[ -n $expr ]] && echo ok)" "ok"
+readarray -t sbj < <(sed 's://.*::g' "$cfg" | jq -r "$expr" 2>/dev/null)
+fields=$(echo "$expr" | sed 's/^\[//; s/\] | .*//' | tr -d ' ' | tr ',' '\n')
+i=0
+while read -r f; do
+t "merged $f" "${sbj[$i]}" "$(j "$f")"
+i=$((i+1))
+done <<< "$fields"
+t "merged field count" "${#sbj[@]}" "$i"
 echo "FAILS: $fails"
 exit $((fails > 0))

@@ -77,14 +77,17 @@ x86_64) cpu=amd64;;
 esac
 if [[ -n $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk -F ' ' '{print $3}') ]]; then
 bbr=`sysctl net.ipv4.tcp_congestion_control | awk -F ' ' '{print $3}'`
-elif [[ -n $(ping 10.0.0.2 -c 2 | grep ttl) ]]; then
+elif [[ -n $(ping 10.0.0.2 -c 2 -W 1 2>/dev/null | grep ttl) ]]; then
 bbr="Openvz版bbr-plus"
 else
 bbr="Openvz/Lxc"
 fi
 hostname=$(hostname)
 
-if [ ! -f sbyg_update ]; then
+# 依赖安装标记：原先写在当前目录（相对路径），在其它目录运行 sb 会重新执行 apt update / 安装全部依赖
+SBDEPS=/root/sbyg_update
+[[ -f sbyg_update && ! -f $SBDEPS ]] && touch $SBDEPS 2>/dev/null
+if [ ! -f $SBDEPS ]; then
 green "首次安装Sing-box-yg脚本必要的依赖……"
 if command -v apk >/dev/null 2>&1; then
 apk update
@@ -103,10 +106,11 @@ if [ -x "$(command -v apt-get)" ]; then
 apt update -y
 apt install jq cron socat busybox iptables-persistent coreutils util-linux -y
 elif [ -x "$(command -v yum)" ]; then
-yum update -y && yum install epel-release -y
+# 只刷新软件源缓存（原先 yum/dnf update -y 会升级整个系统，首次运行要等很久）
+yum makecache -y && yum install epel-release -y
 yum install jq socat busybox coreutils util-linux -y
 elif [ -x "$(command -v dnf)" ]; then
-dnf update -y
+dnf makecache -y
 dnf install jq socat busybox coreutils util-linux -y
 fi
 if [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then
@@ -122,23 +126,24 @@ if [[ -z $vi ]]; then
 apt install iputils-ping iproute2 systemctl -y
 fi
 
+# 缺少的软件包一次安装（原先逐个调用包管理器）；整体失败时（某个包名在该系统不存在）再逐个安装
 packages=("curl" "openssl" "iptables" "tar" "expect" "wget" "xxd" "python3" "qrencode" "git")
-inspackages=("curl" "openssl" "iptables" "tar" "expect" "wget" "xxd" "python3" "qrencode" "git")
-for i in "${!packages[@]}"; do
-package="${packages[$i]}"
-inspackage="${inspackages[$i]}"
-if ! command -v "$package" &> /dev/null; then
-if [ -x "$(command -v apt-get)" ]; then
-apt-get install -y "$inspackage"
-elif [ -x "$(command -v yum)" ]; then
-yum install -y "$inspackage"
-elif [ -x "$(command -v dnf)" ]; then
-dnf install -y "$inspackage"
-fi
-fi
+missing=()
+for package in "${packages[@]}"; do
+command -v "$package" &> /dev/null || missing+=("$package")
 done
+if [[ ${#missing[@]} -gt 0 ]]; then
+if [ -x "$(command -v apt-get)" ]; then pm=apt-get
+elif [ -x "$(command -v yum)" ]; then pm=yum
+elif [ -x "$(command -v dnf)" ]; then pm=dnf
+else pm=
 fi
-touch sbyg_update
+if [[ -n $pm ]] && ! $pm install -y "${missing[@]}"; then
+for package in "${missing[@]}"; do $pm install -y "$package"; done
+fi
+fi
+fi
+touch $SBDEPS
 fi
 
 if [[ $vi = openvz ]]; then
@@ -218,9 +223,16 @@ v4v6(){
 v4v6_start
 v4v6_collect
 }
+# IPv4/IPv6 两个查询同时进行（原先依次最多各等5秒）；安装过程中已检测过时（sbwarpok）不再重复
 warpcheck(){
-wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+[[ -n $sbwarpok ]] && return 0
+local f
+f=$(mktemp 2>/dev/null) || f=/tmp/sbwarp.$$
+curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep warp | cut -d= -f2 > "$f" &
+wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep warp | cut -d= -f2)
+wait $! 2>/dev/null
+wgcfv6=$(cat "$f" 2>/dev/null)
+rm -f "$f"
 }
 
 # ---------------------------------------------------------------- 系统 DNS（纯IPv6 VPS 的 NAT64/DNS64）
@@ -371,6 +383,56 @@ red "输入错误,请重新选择" && openyn
 fi
 }
 
+# ---------------------------------------------------------------- Sing-box 内核下载
+# 原先：curl 不带 -f，GitHub 返回 404 时把错误页面存成 tar.gz；最新版本号靠抓取 GitHub 网页，取不到时下载地址变成 v/sing-box--linux-xxx；
+# 升级时下载失败或文件损坏，旧内核仍在原位，于是仍提示「成功升级」。现在下载到临时目录，解压并实际运行 `version` 校验后才替换
+SBCORE_DIR=${SBCORE_DIR:-/etc/s-box}
+SBCORE_URL=${SBCORE_URL:-https://github.com/SagerNet/sing-box/releases/download}
+sbcorevalid(){ [[ $1 =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(-(alpha|beta|rc)\.[0-9]{1,3})?$ ]]; }
+# 最新正式版（$1=pre 为测试版）：优先用主菜单已查询到的结果，其次 GitHub 跳转地址，最后 jsDelivr
+sbcorelatest(){
+local v
+if [[ $1 == pre ]]; then
+v=$precore
+sbcorevalid "$v" || { lapre; v=$precore; }
+else
+v=$latcore
+sbcorevalid "$v" || v=$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 10 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | sed -n 's#.*/tag/v##p')
+sbcorevalid "$v" || { lapre; v=$latcore; }
+fi
+sbcorevalid "$v" && echo "$v"
+}
+# 下载并校验内核：sbcorefetch 版本 → 解压后的可执行文件路径（临时目录中）；失败返回非0并说明原因
+sbcorefetch(){
+local ver=$1 name d
+sbcorevalid "$ver" || { red "内核版本号格式错误：$ver" >&2; return 1; }
+name="sing-box-$ver-linux-$cpu"
+d=$(mktemp -d "$SBCORE_DIR/.core.XXXXXX" 2>/dev/null) || { red "无法创建临时目录" >&2; return 1; }
+if ! curl -fL --retry 2 --connect-timeout 15 ${SBCORE_QUIET:--#} -o "$d/core.tar.gz" "$SBCORE_URL/v$ver/$name.tar.gz"; then
+rm -rf "$d"; red "下载 Sing-box $ver 内核失败：版本不存在，或VPS无法访问Github" >&2; return 1
+fi
+if ! tar xzf "$d/core.tar.gz" -C "$d" "$name/sing-box" 2>/dev/null || [[ ! -s $d/$name/sing-box ]]; then
+rm -rf "$d"; red "下载的 Sing-box 内核压缩包不完整或已损坏" >&2; return 1
+fi
+chmod 755 "$d/$name/sing-box"
+if ! "$d/$name/sing-box" version 2>/dev/null | grep -qF "$ver"; then
+rm -rf "$d"; red "下载的 Sing-box 内核无法在本机运行（CPU架构：$cpu）" >&2; return 1
+fi
+echo "$d/$name/sing-box"
+}
+# 替换内核：先写到同目录再 mv（原子替换，正在运行的旧内核不受影响）；旧内核保留为 sing-box.bak 供回滚
+sbcoreinstall(){
+local bin=$1 dir
+dir=${bin%/*}; dir=${dir%/*}
+[[ -f $SBCORE_DIR/sing-box ]] && cp -f "$SBCORE_DIR/sing-box" "$SBCORE_DIR/sing-box.bak"
+cp -f "$bin" "$SBCORE_DIR/sing-box.new" && chown root:root "$SBCORE_DIR/sing-box.new" 2>/dev/null
+chmod 755 "$SBCORE_DIR/sing-box.new" && mv -f "$SBCORE_DIR/sing-box.new" "$SBCORE_DIR/sing-box"
+local rc=$?
+rm -rf "$dir"
+return $rc
+}
+
+# 安装第一步：选择内核版本并在后台开始下载（下载期间继续设置证书、端口等），sbcorewait 等待完成
 inssb(){
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "使用哪个内核版本？"
@@ -378,27 +440,36 @@ yellow "1：使用目前最新正式版内核 (回车默认)"
 yellow "2：使用之前1.10.7正式版内核 (支持geosite分流、IP优选级切换，无Anytls协议)"
 readp "请选择【1-2】：" menu
 if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
-sbcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases/latest | grep -oP 'tag/v\K[0-9.]+' | head -n 1)
+sbcore=$(sbcorelatest)
+[[ -n $sbcore ]] || { red "获取 Sing-box 最新版本号失败，请检测VPS的网络是否可以访问Github，再运行安装一次"; exit 1; }
 else
 sbcore='1.10.7'
 fi
-sbname="sing-box-$sbcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$sbcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
-tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-mv /etc/s-box/$sbname/sing-box /etc/s-box
-rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
-if [[ -f '/etc/s-box/sing-box' ]]; then
-chown root:root /etc/s-box/sing-box
-chmod +x /etc/s-box/sing-box
-blue "成功安装 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')"
-sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-else
-red "下载 Sing-box 内核不完整，安装失败，请再运行安装一次" && exit
+# 端口设置需要知道内核系列（1.10 没有 Anytls），由版本号即可确定，不必等下载完成
+sbnh=$(echo "$sbcore" | cut -d '.' -f 1,2)
+blue "Sing-box 内核 $sbcore 将在后台下载，请继续完成以下设置"
+sbcorelog="$SBCORE_DIR/.core-download.log"
+( SBCORE_QUIET=-sS sbcorefetch "$sbcore" > "$sbcorelog.out" 2> "$sbcorelog" ) &
+sbcorepid=$!
+}
+sbcorewait(){
+local bin
+if [[ -n $sbcorepid ]] && kill -0 "$sbcorepid" 2>/dev/null; then
+blue "等待 Sing-box 内核下载完成……"
 fi
-else
-red "下载 Sing-box 内核失败，请再运行安装一次，并检测VPS的网络是否可以访问Github" && exit
+wait "$sbcorepid" 2>/dev/null
+bin=$(cat "$sbcorelog.out" 2>/dev/null)
+if [[ -z $bin || ! -x $bin ]]; then
+# 后台下载失败：前台再试一次并显示进度与原因
+sed 's/\x1b\[[0-9;]*m//g' "$sbcorelog" 2>/dev/null | grep -v '^\s*$' | tail -n 3
+yellow "重新下载 Sing-box 内核……"
+bin=$(sbcorefetch "$sbcore") || { rm -f "$sbcorelog" "$sbcorelog.out"; red "Sing-box 内核安装失败，请检测VPS的网络是否可以访问Github，再运行安装一次"; exit 1; }
 fi
+rm -f "$sbcorelog" "$sbcorelog.out"
+sbcoreinstall "$bin" || { red "Sing-box 内核安装失败"; exit 1; }
+rm -f "$SBCORE_DIR/sing-box.bak"
+blue "成功安装 Sing-box 内核版本：$("$SBCORE_DIR/sing-box" version | awk '/version/{print $NF}')"
+sbnh=$("$SBCORE_DIR/sing-box" version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
 }
 
 inscertificate(){
@@ -714,6 +785,9 @@ fi
 [[ -n $sbapi_on ]] && blue "API管理      ：$apiport/TCP"
 sbfwask $(sbinsports)
 SBRESERVED=
+}
+# 需要内核：在 sbcorewait 之后执行
+insuuid(){
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "四、自动生成各个协议统一的uuid (密码)"
 uuid=$(/etc/s-box/sing-box generate uuid)
@@ -1208,7 +1282,6 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable sing-box >/dev/null 2>&1
-systemctl start sing-box
 systemctl restart sing-box
 fi
 }
@@ -1239,7 +1312,8 @@ for i in 1 2 3 4 5; do
 sleep 1
 done
 if [[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") && -f '/etc/s-box/sb.json' ]]; then
-v4v6
+# 安装时已在开头后台查询本机IP（v4v6_start），这里直接取结果；其它情况现在查询
+v4v6_collect
 if [[ -n $v4 && -n $v6 ]]; then
 green "调整IPv4/IPV6配置输出"
 yellow "1：刷新本地IP，使用IPV4配置输出 (回车默认) "
@@ -1301,6 +1375,9 @@ fi
 }
 
 result_vl_vm_hy_tu(){
+# sb.json 中用到的字段一次读取（原先每个字段单独运行一次 sed + jq，共15次）；顺序见下方 jq 表达式
+local sbj
+readarray -t sbj < <(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '[.inbounds[0].users[0].uuid, .inbounds[0].listen_port, .inbounds[0].tls.server_name, .inbounds[0].tls.reality.short_id[0], .inbounds[1].transport.path, .inbounds[1].listen_port, .inbounds[1].tls.enabled, .inbounds[1].tls.server_name, .inbounds[2].listen_port, .inbounds[2].tls.key_path, .inbounds[3].listen_port, .inbounds[3].tls.key_path, .inbounds[4].listen_port, .inbounds[4].tls.key_path] | .[] | tostring' 2>/dev/null)
 if [[ -f /root/ygkkkca/cert.crt && -f /root/ygkkkca/private.key && -s /root/ygkkkca/cert.crt && -s /root/ygkkkca/private.key ]]; then
 ym=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
 echo $ym > /root/ygkkkca/ca.log
@@ -1308,21 +1385,21 @@ fi
 rm -rf /etc/s-box/vm_ws_argo.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt
 server_ip=$(cat /etc/s-box/server_ip.log)
 server_ipcl=$(cat /etc/s-box/server_ipcl.log)
-uuid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
-vl_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].listen_port')
-vl_name=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.server_name')
+uuid=${sbj[0]}
+vl_port=${sbj[1]}
+vl_name=${sbj[2]}
 public_key=$(cat /etc/s-box/public.key)
-short_id=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.reality.short_id[0]')
+short_id=${sbj[3]}
 argo=$(cat /etc/s-box/argo.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
-ws_path=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')
-vm_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')
-tls=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].tls.enabled')
-vm_name=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].tls.server_name')
+ws_path=${sbj[4]}
+vm_port=${sbj[5]}
+tls=${sbj[6]}
+vm_name=${sbj[7]}
 if [[ "$tls" = "false" ]]; then
 if [[ -f /etc/s-box/cfymjx.txt ]]; then
 vm_name=$(cat /etc/s-box/cfymjx.txt 2>/dev/null)
 else
-vm_name=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].tls.server_name')
+vm_name=${sbj[7]}
 fi
 vmadd_local=$server_ipcl
 vmadd_are_local=$server_ip
@@ -1338,7 +1415,7 @@ if [[ "$tls" = "false" ]]; then
 if [[ -f /etc/s-box/cfymjx.txt ]]; then
 vm_name=$(cat /etc/s-box/cfymjx.txt 2>/dev/null)
 else
-vm_name=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].tls.server_name')
+vm_name=${sbj[7]}
 fi
 vmadd_local=$server_ipcl
 vmadd_are_local=$server_ip
@@ -1352,7 +1429,7 @@ vmadd_argo=$(cat /etc/s-box/cfvmadd_argo.txt 2>/dev/null)
 else
 vmadd_argo=cloudflare-ech.com
 fi
-hy2_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[2].listen_port')
+hy2_port=${sbj[8]}
 hy2_ports=$(iptables -t nat -nL --line 2>/dev/null | grep -w "$hy2_port" | awk '{print $8}' | sed 's/dpts://; s/dpt://' | tr '\n' ',' | sed 's/,$//')
 if [[ -n $hy2_ports ]]; then
 cmhy2pt=$(echo $hy2_ports | tr ':' '-')
@@ -1362,7 +1439,7 @@ else
 hyps=
 fi
 ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
-hy2_sniname=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[2].tls.key_path')
+hy2_sniname=${sbj[9]}
 if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then
 SHA256=$(openssl x509 -in /etc/s-box/cert.pem -outform DER | sha256sum | awk '{print $1}')
 echo "$SHA256" > /etc/s-box/SHA256.txt
@@ -1380,9 +1457,9 @@ ins_hy2=0
 hy2_ins=false
 SHA256=
 fi
-tu5_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[3].listen_port')
+tu5_port=${sbj[10]}
 ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
-tu5_sniname=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[3].tls.key_path')
+tu5_sniname=${sbj[11]}
 if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then
 tu5_name=www.bing.com
 sb_tu5_ip=$server_ip
@@ -1396,9 +1473,9 @@ cl_tu5_ip=$ym
 ins=0
 tu5_ins=false
 fi
-an_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[4].listen_port')
+an_port=${sbj[12]}
 ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
-an_sniname=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[4].tls.key_path')
+an_sniname=${sbj[13]}
 if [[ "$an_sniname" = '/etc/s-box/private.key' ]]; then
 an_name=www.bing.com
 sb_an_ip=$server_ip
@@ -2851,11 +2928,17 @@ fi
 mkdir -p /etc/s-box
 chmod 700 /etc/s-box
 v6
+# 本次安装期间 WARP 状态不变：后面生成节点链接时不再重复检测（原先需再等最多10秒）
+sbwarpok=1
+# WARP 未开启时，本机公网IP在后台查询，安装完成生成链接时直接使用（原先在最后才查询）
+[[ ! $wgcfv4 =~ on|plus && ! $wgcfv6 =~ on|plus ]] && v4v6_start
 openyn
 sbapiask
 inssb
 inscertificate
 insport
+sbcorewait
+insuuid
 echo
 blue "Vless-reality相关key与id将自动生成……"
 key_pair=$(/etc/s-box/sing-box generate reality-keypair)
@@ -2870,12 +2953,13 @@ warpwg
 inssbjsonser
 sbservice
 sbactive
-#curl -sL https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/version/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
-curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
+# 主菜单已获取最新版本号；没有时再下载（加超时，原先无超时，网络不通时会一直卡住）
+if [[ -n $latestV ]]; then echo "$latestV" > /etc/s-box/v; else curl -sL --max-time 10 ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v; fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 lnsb && blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
 echo
 wgcfgo
+sbwarpok=
 green "正在生成节点链接与订阅配置……"
 sbshare > /dev/null 2>&1
 sbapido
@@ -4265,9 +4349,9 @@ green "3：切换Sing-box某个正式版或测试版，需指定版本号 (建�
 green "0：返回上层"
 readp "请选择【0-3】：" menu
 if [ "$menu" = "1" ]; then
-upcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases/latest | grep -oP 'tag/v\K[0-9.]+' | head -n 1)
+upcore=$(sbcorelatest)
 elif [ "$menu" = "2" ]; then
-upcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases | grep -oP '/tag/v\K[0-9.]+-[^"]+' | head -n 1)
+upcore=$(sbcorelatest pre)
 elif [ "$menu" = "3" ]; then
 echo
 red "注意: 版本号在 https://github.com/SagerNet/sing-box/tags 可查，且有Downloads字样 (必须1.10系或者1.30系以上版本)"
@@ -4277,32 +4361,40 @@ readp "请输入Sing-box版本号：" upcore
 else
 sb
 fi
-if [[ -n $upcore ]]; then
-green "开始下载并更新Sing-box内核……请稍等"
-sbname="sing-box-$upcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$upcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
-tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-mv /etc/s-box/$sbname/sing-box /etc/s-box
-rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
-if [[ -f '/etc/s-box/sing-box' ]]; then
-chown root:root /etc/s-box/sing-box
-chmod +x /etc/s-box/sing-box
+upcore=${upcore#v}
+if sbcorevalid "$upcore"; then
+green "开始下载并更新Sing-box内核 $upcore ……请稍等"
+local bin num oldnh
+bin=$(sbcorefetch "$upcore") || { yellow "当前内核未做任何改动"; sleep 2; upsbcroe; return; }
+[[ $upcore == 1.10.* ]] && num=10 || num=11
+# 新内核不兼容当前配置时不替换（原先直接替换，sing-box 无法启动）
+if ! "$bin" check -c /etc/s-box/sb${num}.json >/dev/null 2>&1; then
+rm -rf "${bin%/*/*}"
+red "Sing-box $upcore 与当前配置不兼容（sing-box check 失败），当前内核未做任何改动" && sleep 2 && upsbcroe; return
+fi
+oldnh=$sbnh
+cp -f /etc/s-box/sb.json /etc/s-box/sb.json.bak 2>/dev/null
+sbcoreinstall "$bin" || { red "替换内核失败，当前内核未做任何改动" && upsbcroe; return; }
 sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-[[ "$sbnh" == "1.10" ]] && num=10 || num=11
 sbgeodb
 rm -rf /etc/s-box/sb.json
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
-restartsb && sbshare > /dev/null 2>&1
-blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')" && sleep 3 && sb
-else
-red "下载 Sing-box 内核不完整，安装失败，请重试" && upsbcroe
+restartsb
+# 新内核启动失败：恢复旧内核与配置
+local i ok=
+for i in 1 2 3 4 5 6; do sleep 1; if command -v apk >/dev/null 2>&1; then rc-service sing-box status 2>/dev/null | grep -qw started && ok=1; else systemctl is-active sing-box 2>/dev/null | grep -qx active && ok=1; fi; [[ -n $ok ]] && break; done
+if [[ -z $ok && -f /etc/s-box/sing-box.bak ]]; then
+mv -f /etc/s-box/sing-box.bak /etc/s-box/sing-box
+[[ -f /etc/s-box/sb.json.bak ]] && mv -f /etc/s-box/sb.json.bak /etc/s-box/sb.json
+sbnh=$oldnh
+restartsb
+red "Sing-box $upcore 启动失败，已恢复为原内核 $(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')" && sbdiag && sleep 3 && sb
 fi
+rm -f /etc/s-box/sb.json.bak
+sbshare > /dev/null 2>&1
+blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')（原内核保留为 /etc/s-box/sing-box.bak）" && sleep 3 && sb
 else
-red "下载 Sing-box 内核失败或不存在，请重试" && upsbcroe
-fi
-else
-red "版本号检测出错，请重试" && upsbcroe
+red "版本号检测出错或格式不正确：$upcore，请重试" && upsbcroe
 fi
 }
 
@@ -4324,7 +4416,7 @@ sbhops=$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '.inbounds[2].li
 ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '.inbounds[1].listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
-rm -rf /etc/s-box sbyg_update /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
+rm -rf /etc/s-box sbyg_update $SBDEPS /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
 rm -f /etc/local.d/alpineargo.start /etc/local.d/alpinesub.start /etc/local.d/alpinews5.start
 uncronsb
 # 只删除指向 Hy2/Tuic 端口的端口跳跃规则（原先清空整个 nat PREROUTING 链，会删掉 Docker 等其它程序的规则）
