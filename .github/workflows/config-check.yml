@@ -83,6 +83,11 @@ jobs:
             exit 1
           fi
 
+      - name: merged jq calls == original per-item calls
+        run: |
+          [[ "${{ matrix.core }}" == "1.10.7" ]] && f=sb10.json || f=sb11.json
+          bash tests/config_jq.sh "$PWD/sbox/$f"
+
       - name: systemd service (same unit as sb.sh)
         run: |
           D="$PWD/sbox"
@@ -104,6 +109,22 @@ jobs:
           fi
           sudo tail -n 5 /etc/s-box/sing-box.log || true
 
+      - name: traffic statistics via Clash API (sbagent)
+        run: |
+          sudo cp sbagent.py /etc/s-box/sbagent.py
+          sudo python3 /etc/s-box/sbagent.py trafficon
+          sleep 4
+          systemctl is-active sing-box
+          c=$(sudo python3 -c 'import json;c=json.load(open("/etc/s-box/sbclash.json"));print(c["port"],c["secret"])')
+          set -- $c
+          out=$(curl -s -H "Authorization: Bearer $2" "http://127.0.0.1:$1/connections")
+          echo "$out" | head -c 300; echo
+          echo "$out" | jq -e 'has("connections") and has("uploadTotal")' > /dev/null || { echo "::error title=Clash API (${{ steps.dl.outputs.version }})::$out"; exit 1; }
+          sudo python3 /etc/s-box/sbagent.py traffic --hours 1
+          sudo python3 /etc/s-box/sbagent.py trafficoff
+          sleep 3
+          systemctl is-active sing-box
+
   agent:
     runs-on: ubuntu-latest
     steps:
@@ -114,3 +135,5 @@ jobs:
         run: for f in sb.sh kp.sh serv00.sh serv00keep.sh; do bash -n "$f"; done
       - name: input sanitizing & port validation
         run: bash tests/input.sh
+      - name: sbagent unit tests
+        run: python3 tests/test_sbagent.py

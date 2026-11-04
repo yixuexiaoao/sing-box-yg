@@ -146,20 +146,28 @@ green "TUN守护功能已启动"
 fi
 fi
 fi
-v4v6(){
-local tmpd p1 p2 p3 p4
-tmpd=$(mktemp -d 2>/dev/null) || { tmpd=/tmp/sbv4v6.$$; mkdir -p "$tmpd"; }
-curl -s4m5 icanhazip.com -k > "$tmpd/v4" 2>/dev/null & p1=$!
-curl -s6m5 icanhazip.com -k > "$tmpd/v6" 2>/dev/null & p2=$!
-curl -s4m5 -k https://ip.fm > "$tmpd/d4" 2>/dev/null & p3=$!
-curl -s6m5 -k https://ip.fm > "$tmpd/d6" 2>/dev/null & p4=$!
-wait $p1 $p2 $p3 $p4 2>/dev/null
-v4=$(cat "$tmpd/v4" 2>/dev/null)
-v6=$(cat "$tmpd/v6" 2>/dev/null)
-v4dq=$(sed -n 's/.*Location: //p' "$tmpd/d4" 2>/dev/null)
-v6dq=$(sed -n 's/.*Location: //p' "$tmpd/d6" 2>/dev/null)
-rm -rf "$tmpd"
+# 本机IP/地区的4个查询并行执行；v4v6_start 可提前在后台启动，v4v6_collect 取结果
+v4v6_start(){
+sbv46d=$(mktemp -d 2>/dev/null) || { sbv46d=/tmp/sbv4v6.$$; mkdir -p "$sbv46d"; }
+curl -s4m5 icanhazip.com -k > "$sbv46d/v4" 2>/dev/null & sbv46p="$!"
+curl -s6m5 icanhazip.com -k > "$sbv46d/v6" 2>/dev/null & sbv46p="$sbv46p $!"
+curl -s4m5 -k https://ip.fm > "$sbv46d/d4" 2>/dev/null & sbv46p="$sbv46p $!"
+curl -s6m5 -k https://ip.fm > "$sbv46d/d6" 2>/dev/null & sbv46p="$sbv46p $!"
+}
+v4v6_collect(){
+[[ -n $sbv46d ]] || v4v6_start
+wait $sbv46p 2>/dev/null
+v4=$(cat "$sbv46d/v4" 2>/dev/null)
+v6=$(cat "$sbv46d/v6" 2>/dev/null)
+v4dq=$(sed -n 's/.*Location: //p' "$sbv46d/d4" 2>/dev/null)
+v6dq=$(sed -n 's/.*Location: //p' "$sbv46d/d6" 2>/dev/null)
+rm -rf "$sbv46d"
+sbv46d= sbv46p=
 v4v6done=1
+}
+v4v6(){
+v4v6_start
+v4v6_collect
 }
 warpcheck(){
 wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -2600,6 +2608,7 @@ lnsb && blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
 echo
 wgcfgo
 sbshare
+sbapiwizard
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 blue "可选择9，刷新并显示所有协议配置及分享链接"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -2732,13 +2741,11 @@ fi
 }
 
 allports(){
-vl_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].listen_port')
-vm_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')
-hy2_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[2].listen_port')
-tu5_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[3].listen_port')
-an_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[4].listen_port')
-hy2_ports=$(iptables -t nat -nL --line 2>/dev/null | grep -w "$hy2_port" | awk '{print $8}' | sed 's/dpts://; s/dpt://' | tr '\n' ',' | sed 's/,$//')
-tu5_ports=$(iptables -t nat -nL --line 2>/dev/null | grep -w "$tu5_port" | awk '{print $8}' | sed 's/dpts://; s/dpt://' | tr '\n' ',' | sed 's/,$//')
+read -r vl_port vm_port hy2_port tu5_port an_port <<< "$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '[range(0;5) as $i | (.inbounds[$i].listen_port // "null" | tostring)] | join(" ")')"
+local natrules
+natrules=$(iptables -t nat -nL --line 2>/dev/null)
+hy2_ports=$(echo "$natrules" | grep -w "$hy2_port" | awk '{print $8}' | sed 's/dpts://; s/dpt://' | tr '\n' ',' | sed 's/,$//')
+tu5_ports=$(echo "$natrules" | grep -w "$tu5_port" | awk '{print $8}' | sed 's/dpts://; s/dpt://' | tr '\n' ',' | sed 's/,$//')
 [[ -n $hy2_ports ]] && hy2zfport="$hy2_ports" || hy2zfport="未添加"
 [[ -n $tu5_ports ]] && tu5zfport="$tu5_ports" || tu5zfport="未添加"
 }
@@ -3505,8 +3512,10 @@ vps_ipv4="当前IP：$v4"
 vps_ipv6='无本地IPV6，黑名单模式'
 fi
 unset swg4 swd4 swd6 swg6 ssd4 ssg4 ssd6 ssg6 sad4 sag4 sad6 sag6
-wd4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[1].domain_suffix | join(" ")')
-wg4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[1].geosite | join(" ")' 2>/dev/null)
+# 一次 jq 取出全部分流规则（原来每项单独调用一次 jq）
+readarray -t sbfl < <(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules as $r | range(1;7) as $i | (($r[$i].domain_suffix // []) | join(" ")), (($r[$i].geosite // []) | join(" "))' 2>/dev/null)
+wd4=${sbfl[0]}
+wg4=${sbfl[1]}
 if [[ "$wd4" == "yg_kkk" && ("$wg4" == "yg_kkk" || -z "$wg4") ]]; then
 wfl4="${yellow}【warp出站IPV4可用】未分流${plain}"
 else
@@ -3519,8 +3528,8 @@ fi
 wfl4="${yellow}【warp出站IPV4可用】已分流：$swd4$swg4${plain} "
 fi
 
-wd6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[2].domain_suffix | join(" ")')
-wg6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[2].geosite | join(" ")' 2>/dev/null)
+wd6=${sbfl[2]}
+wg6=${sbfl[3]}
 if [[ "$wd6" == "yg_kkk" && ("$wg6" == "yg_kkk"|| -z "$wg6") ]]; then
 wfl6="${yellow}【warp出站IPV6自测】未分流${plain}"
 else
@@ -3533,8 +3542,8 @@ fi
 wfl6="${yellow}【warp出站IPV6自测】已分流：$swd6$swg6${plain} "
 fi
 
-sd4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[3].domain_suffix | join(" ")')
-sg4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[3].geosite | join(" ")' 2>/dev/null)
+sd4=${sbfl[4]}
+sg4=${sbfl[5]}
 if [[ "$sd4" == "yg_kkk" && ("$sg4" == "yg_kkk" || -z "$sg4") ]]; then
 sfl4="${yellow}【$warp_s4_ip】未分流${plain}"
 else
@@ -3547,8 +3556,8 @@ fi
 sfl4="${yellow}【$warp_s4_ip】已分流：$ssd4$ssg4${plain} "
 fi
 
-sd6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[4].domain_suffix | join(" ")')
-sg6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[4].geosite | join(" ")' 2>/dev/null)
+sd6=${sbfl[6]}
+sg6=${sbfl[7]}
 if [[ "$sd6" == "yg_kkk" && ("$sg6" == "yg_kkk" || -z "$sg6") ]]; then
 sfl6="${yellow}【$warp_s6_ip】未分流${plain}"
 else
@@ -3561,8 +3570,8 @@ fi
 sfl6="${yellow}【$warp_s6_ip】已分流：$ssd6$ssg6${plain} "
 fi
 
-ad4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[5].domain_suffix | join(" ")' 2>/dev/null)
-ag4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[5].geosite | join(" ")' 2>/dev/null)
+ad4=${sbfl[8]}
+ag4=${sbfl[9]}
 if [[ ("$ad4" == "yg_kkk" || -z "$ad4") && ("$ag4" == "yg_kkk" || -z "$ag4") ]]; then
 adfl4="${yellow}【$vps_ipv4】未分流${plain}" 
 else
@@ -3575,8 +3584,8 @@ fi
 adfl4="${yellow}【$vps_ipv4】已分流：$sad4$sag4${plain} "
 fi
 
-ad6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[6].domain_suffix | join(" ")' 2>/dev/null)
-ag6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[6].geosite | join(" ")' 2>/dev/null)
+ad6=${sbfl[10]}
+ag6=${sbfl[11]}
 if [[ ("$ad6" == "yg_kkk" || -z "$ad6") && ("$ag6" == "yg_kkk" || -z "$ag6") ]]; then
 adfl6="${yellow}【$vps_ipv6】未分流${plain}" 
 else
@@ -3916,7 +3925,11 @@ green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
 }
 
 lapre(){
+if [[ -n $1 && -s $1 ]]; then
+json=$(cat "$1")
+else
 json=$(curl -Ls --max-time 3 https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box)
+fi
 if echo "$json"|grep -q '"versions"'; then
 latcore=$(echo "$json"|grep -Eo '"[0-9.]+",'|head -n1|tr -d '",')
 precore=$(echo "$json"|grep -Eo '"[0-9.]*-[^"]*"'|head -n1|tr -d '",')
@@ -4419,8 +4432,13 @@ yellow "7：查看认证失败/主动探测记录"
 yellow "8：查看当前在线客户端IP"
 yellow "9：实时查看原始日志"
 yellow "10：清空日志"
+yellow "11：流量统计查询 (按IP/访问地址/日期/小时/协议，可选时间段)"
+yellow "12：开启/关闭流量统计"
+yellow "13：日志策略 (单文件上限/归档份数/压缩/保留天数)"
+yellow "14：按时间段删除日志"
+yellow "15：清理流量统计记录"
 yellow "0：返回主菜单"
-readp "请选择【0-10】：" menu
+readp "请选择【0-15】：" menu
 case "$menu" in
 1 ) $sbag logon >/dev/null && green "连接日志已开启";;
 2 ) $sbag logoff >/dev/null && green "连接日志已关闭";;
@@ -4437,6 +4455,40 @@ $sbag logs --limit 300 ${qip:+--ip "$qip"} ${qkw:+--q "$qkw"};;
 8 ) $sbag peers;;
 9 ) red "退出 Ctrl+c" && tail -n 50 -f /etc/s-box/sing-box.log;;
 10 ) $sbag clearlog >/dev/null && green "日志已清空";;
+11 ) yellow "统计方式：1、按源IP (回车默认)  2、按访问地址  3、按日期  4、按小时  5、按协议  6、按 源IP+访问地址"
+readp "请选择【1-6】：" sel
+case "$sel" in 2 ) by=host;; 3 ) by=day;; 4 ) by=hour;; 5 ) by=inbound;; 6 ) by=ip_host;; * ) by=ip;; esac
+readp "开始时间 (如 2026-11-01 或 2026-11-01 08:00，回车表示最近24小时)：" tstart
+readp "结束时间 (回车表示现在)：" tend
+readp "筛选源IP (可部分匹配，回车跳过)：" qip
+readp "筛选访问地址关键字 (回车跳过)：" qkw
+$sbag traffic --by "$by" ${tstart:+--start "$tstart"} ${tend:+--end "$tend"} ${qip:+--ip "$qip"} ${qkw:+--host "$qkw"} --limit 50;;
+12 ) yellow "1：开启流量统计  2：关闭流量统计"
+readp "请选择【1-2】：" sel
+if [ "$sel" = "1" ]; then
+$sbag trafficon >/dev/null && green "流量统计已开启 (需API服务运行，主菜单19)"
+systemctl is-active sbagent >/dev/null 2>&1 || rc-service sbagent status 2>/dev/null | grep -q started || yellow "API服务未运行，流量不会被采集，请在主菜单19安装/启动"
+elif [ "$sel" = "2" ]; then
+$sbag trafficoff >/dev/null && green "流量统计已关闭"
+fi;;
+13 ) $sbag logpolicy
+readp "单个日志文件上限MB (回车不修改)：" mb
+readp "保留归档份数 (回车不修改)：" keep
+readp "归档是否gzip压缩 1、是 0、否 (回车不修改)：" gz
+readp "归档保留天数，0为不限 (回车不修改)：" days
+$sbag logpolicy ${mb:+--max-mb "$mb"} ${keep:+--keep "$keep"} ${gz:+--compress "$gz"} ${days:+--retain-days "$days"};;
+14 ) yellow "1：删除N天以前的日志  2：删除指定时间段的日志"
+readp "请选择【1-2】：" sel
+if [ "$sel" = "1" ]; then
+readp "删除几天以前的日志：" days
+[ -n "$days" ] && $sbag logprune --days "$days"
+elif [ "$sel" = "2" ]; then
+readp "开始时间 (如 2026-11-01 08:00)：" tstart
+readp "结束时间 (如 2026-11-02)：" tend
+$sbag logprune --start "$tstart" --end "$tend"
+fi;;
+15 ) readp "删除几天以前的流量记录 (回车默认90)：" days
+$sbag trafficpurge --days "${days:-90}";;
 * ) sb;;
 esac
 sbpause && sbaccesslog
@@ -4518,6 +4570,45 @@ esac
 sbpause && sbresetmenu
 }
 
+sbapiwizard(){
+red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+green "六、是否开启API管理？"
+blue "配合 sing-box-yg-worker (Cloudflare Worker) 网页面板，统一管理多台服务器：访问日志、流量统计、一键重置参数、订阅等"
+yellow "1：开启"
+yellow "2：暂不开启 (回车默认，以后可在主菜单19开启)"
+readp "请选择【1-2】：" menu
+[ "$menu" = "1" ] || return 0
+sbagentchk || return 0
+port=
+readp "\n设置API端口 (TCP，回车跳过为10000-65535之间的随机端口)：" port
+chooseport
+apiport=$port
+echo
+green "设置API权限 (Token万一泄露时，限制对方能做的事)："
+yellow "1：完全管理：查看日志/流量、查看节点链接、重置参数、重启等 (回车默认)"
+yellow "2：只读 + 查看节点链接：不能重置、重启或修改任何设置"
+yellow "3：仅只读：只能查看状态、日志与流量，看不到节点链接"
+readp "请选择【1-3】：" sel
+case "$sel" in
+2 ) apiperms=read,links;;
+3 ) apiperms=read;;
+* ) apiperms=read,links,manage;;
+esac
+echo
+yellow "可选：只允许指定IP/网段访问API，多个用逗号分隔 (回车不限制)"
+yellow "注意：Cloudflare Worker 的出口IP不固定，填写后Worker面板可能无法连接，一般请直接回车"
+readp "API访问IP白名单：" apiallow
+readp "是否开启流量统计 (按日期/IP/访问地址统计流量)？1、开启 (回车默认)  2、不开启：" sel
+if ! $sbag apiinstall --port "$apiport" --perms "$apiperms" --allow "$apiallow" >/dev/null; then
+red "API服务安装失败，可稍后在主菜单19重试" && return 0
+fi
+if [ "$sel" != "2" ]; then
+$sbag trafficon >/dev/null 2>&1 && green "流量统计已开启" || yellow "流量统计开启失败，可稍后在主菜单17重试"
+fi
+green "API服务已开启"
+sbapishow
+}
+
 sbapimenu(){
 sbactive
 sbagentchk || return
@@ -4540,8 +4631,12 @@ yellow "2：查看对接信息 (复制到Worker面板的「添加服务器」)"
 yellow "3：更换API密钥Token"
 yellow "4：更换API端口"
 yellow "5：卸载API服务"
+yellow "6：设置API权限 (完全管理 / 只读+节点链接 / 仅只读)"
+yellow "7：设置API访问IP白名单"
+yellow "8：设置两次重置参数的最小间隔 (防止Token泄露后被反复重置)"
+yellow "9：查看API访问审计日志 (来源IP、操作、结果)"
 yellow "0：返回主菜单"
-readp "请选择【0-5】：" menu
+readp "请选择【0-9】：" menu
 case "$menu" in
 1 ) $sbag apiinstall >/dev/null && green "API服务已启动" && sbapishow;;
 2 ) sbapishow;;
@@ -4552,6 +4647,24 @@ apiport=$(shuf -i 10000-65535 -n 1)
 fi
 $sbag apiinstall --port "$apiport" >/dev/null && green "API端口已更换" && sbapishow;;
 5 ) $sbag apiuninstall >/dev/null && green "API服务已卸载";;
+6 ) yellow "1：完全管理  2：只读 + 查看节点链接  3：仅只读"
+readp "请选择【1-3】：" sel
+case "$sel" in
+1 ) $sbag apiset --perms read,links,manage >/dev/null && green "已设置为完全管理";;
+2 ) $sbag apiset --perms read,links >/dev/null && green "已设置为只读 + 查看节点链接";;
+3 ) $sbag apiset --perms read >/dev/null && green "已设置为仅只读";;
+esac;;
+7 ) blue "当前白名单：$(python3 -c 'import json;print(",".join(json.load(open("/etc/s-box/sbapi.json")).get("allow") or []) or "不限制")' 2>/dev/null)"
+yellow "注意：Cloudflare Worker 的出口IP不固定，填写后Worker面板可能无法连接"
+readp "输入IP/网段，多个用逗号分隔 (输入 0 表示取消限制，回车不修改)：" apiallow
+if [ "$apiallow" = "0" ]; then
+$sbag apiset --allow "" >/dev/null && green "已取消IP限制"
+elif [ -n "$apiallow" ]; then
+$sbag apiset --allow "$apiallow" >/dev/null && green "IP白名单已更新"
+fi;;
+8 ) readp "两次重置的最小间隔秒数 (回车默认600，0表示不限制)：" sec
+$sbag apiset --reset-interval "${sec:-600}" >/dev/null && green "已设置";;
+9 ) $sbag apilog --lines 100;;
 * ) sb;;
 esac
 sbpause && sbapimenu
@@ -4563,7 +4676,8 @@ yellow "API服务未安装" && return
 fi
 echo
 green "对接信息如下 (整段JSON粘贴到Worker面板「添加服务器」即可)："
-blue "$($sbag apiinfo | python3 -c 'import json,sys;d=json.load(sys.stdin);d.pop("running",None);print(json.dumps(d,ensure_ascii=False))')"
+blue "$($sbag apiinfo | python3 -c 'import json,sys;d=json.load(sys.stdin);print(json.dumps({k:d[k] for k in ("name","host","port","path","token")},ensure_ascii=False))')"
+blue "API权限：$($sbag apiinfo | python3 -c 'import json,sys;m={"read":"只读","links":"节点链接","manage":"管理"};print("、".join(m[x] for x in json.load(sys.stdin)["perms"]))')"
 echo
 yellow "1、请确保VPS后台防火墙已开放该TCP端口：$(python3 -c 'import json;print(json.load(open("/etc/s-box/sbapi.json"))["port"])')"
 yellow "2、Token等同于服务器管理权限，切勿泄露；如已泄露请选择3更换"
@@ -4594,6 +4708,11 @@ sbshare > /dev/null 2>&1
 exit 0
 fi
 
+# 主菜单需要的网络查询同时在后台进行，避免依次等待
+sbpre=$(mktemp -d 2>/dev/null) || { sbpre=/tmp/sbpre.$$; mkdir -p "$sbpre"; }
+curl -sL --max-time 5 ${sbrepo}/version > "$sbpre/ver" 2>/dev/null & sbpp1=$!
+curl -Ls --max-time 3 https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box > "$sbpre/jsd" 2>/dev/null & sbpp2=$!
+v4v6_start
 clear
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" 
 echo -e "${bblue} ░██     ░██      ░██ ██ ██         ░█${plain}█   ░██     ░██   ░██     ░█${red}█   ░██${plain}  "
@@ -4636,7 +4755,8 @@ white "-------------------------------------------------------------------------
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
-verinfo=$(curl -sL --max-time 5 ${sbrepo}/version)
+wait $sbpp1 2>/dev/null
+verinfo=$(cat "$sbpre/ver" 2>/dev/null)
 latestV=$(echo "$verinfo" | awk -F "更新内容" '{print $1}' | head -n 1)
 if [ -f /etc/s-box/v ]; then
 if [ "$insV" = "$latestV" ]; then
@@ -4651,7 +4771,9 @@ echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${latestV}${plain}"
 yellow "未安装 Sing-box-yg 脚本！请先选择 1 安装"
 fi
 
-lapre
+wait $sbpp2 2>/dev/null
+lapre "$sbpre/jsd"
+rm -rf "$sbpre"
 if [ -f '/etc/s-box/sb.json' ]; then
 if [[ $inscore =~ ^[0-9.]+$ ]]; then
 if [ "${inscore}" = "${latcore}" ]; then
@@ -4688,7 +4810,7 @@ fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo -e "VPS状态如下："
 echo -e "系统:$blue$op$plain  \c";echo -e "内核:$blue$version$plain  \c";echo -e "处理器:$blue$cpu$plain  \c";echo -e "虚拟化:$blue$vi$plain  \c";echo -e "BBR算法:$blue$bbr$plain"
-v4v6
+v4v6_collect
 if [[ "$v6" == "2a09"* ]]; then
 w6="【WARP】"
 fi

@@ -9,8 +9,10 @@ import argparse
 import base64
 import collections
 import datetime
+import gzip
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -22,11 +24,17 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid as uuidlib
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "1.0.1"
+try:
+    import sqlite3
+except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
+    sqlite3 = None
+
+VERSION = "1.1.0"
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
 SB_BIN = os.environ.get("SB_BIN", os.path.join(SB_DIR, "sing-box"))
 SB_CMD = os.environ.get("SB_CMD", "/usr/bin/sb")
@@ -35,6 +43,10 @@ LOG_FILE = os.path.join(SB_DIR, "sing-box.log")
 API_CONF = os.path.join(SB_DIR, "sbapi.json")
 LEAK_CONF = os.path.join(SB_DIR, "sbleak.json")
 RESET_LOG = os.path.join(SB_DIR, "sbreset.log")
+LOG_POLICY_CONF = os.path.join(SB_DIR, "sblog.json")
+CLASH_CONF = os.path.join(SB_DIR, "sbclash.json")
+TRAFFIC_DB = os.path.join(SB_DIR, "sbtraffic.db")
+API_LOG = os.path.join(SB_DIR, "sbapi.log")
 CONF_NAMES = ("sb10.json", "sb11.json", "sb.json")
 LOG_MAX_MB = 10
 # 与 sb.sh 的 cronsb 写入的轮转任务相同（纯shell，不依赖python）
@@ -189,25 +201,52 @@ def _file_id(path):
         return None
 
 
+def log_archives():
+    """归档日志，按新→旧：sing-box.log.1（未压缩）、sing-box.log.1.gz、.2.gz ..."""
+    out = [LOG_FILE + ".1"] if os.path.exists(LOG_FILE + ".1") else []
+    i = 1
+    while os.path.exists("%s.%d.gz" % (LOG_FILE, i)):
+        out.append("%s.%d.gz" % (LOG_FILE, i))
+        i += 1
+    return out
+
+
+def _read_file(path):
+    if path.endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            return f.read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def read_log_data(max_bytes=LOG_BUDGET):
-    """读取 .1 与当前日志的尾部，返回 (按时间顺序的文本块列表, 当前文件已读到的完整行位置)。"""
+    """读取当前日志与归档（含 .gz）的尾部，返回 (按时间顺序的文本块列表, 当前文件已读到的完整行位置)。"""
     chunks = []
     pos = 0
     budget = max_bytes
-    for path in (LOG_FILE, LOG_FILE + ".1"):
-        if budget <= 0 or not os.path.exists(path):
-            continue
-        with open(path, "rb") as f:
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "rb") as f:
             size = os.fstat(f.fileno()).st_size
             start = max(0, size - budget)
             f.seek(start)
             data = f.read(size - start)
         if start:
             data = data[data.find(b"\n") + 1:]
-        if path == LOG_FILE:
-            cut = data.rfind(b"\n") + 1  # 只取完整行，未写完的行留给下次增量读取
-            pos = size - (len(data) - cut)
-            data = data[:cut]
+        cut = data.rfind(b"\n") + 1  # 只取完整行，未写完的行留给下次增量读取
+        pos = size - (len(data) - cut)
+        data = data[:cut]
+        budget -= len(data)
+        chunks.insert(0, data)
+    for path in log_archives():
+        if budget <= 0:
+            break
+        try:
+            data = _read_file(path)
+        except (OSError, EOFError, zlib.error):
+            continue
+        if len(data) > budget:
+            data = data[len(data) - budget:]
+            data = data[data.find(b"\n") + 1:]
         budget -= len(data)
         chunks.insert(0, data)
     return chunks, pos
@@ -339,7 +378,7 @@ class LogIndex(object):
         with self.lock:
             self.used = time.time()
             cur = _file_id(LOG_FILE)
-            rot = _file_id(LOG_FILE + ".1")
+            rot = tuple(_file_id(p) for p in log_archives())
             ident = cur[:2] if cur else None
             if self.parser is None or ident != self.ident or rot != self.rot or (cur and cur[2] < self.pos):
                 chunks, self.pos = read_log_data()
@@ -405,8 +444,10 @@ def filter_recs(recs, hours=None, ip=None, q=None, proto=None, only_err=False, h
 
 def log_info():
     size = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
-    size1 = os.path.getsize(LOG_FILE + ".1") if os.path.exists(LOG_FILE + ".1") else 0
-    return {"enabled": logging_enabled(), "file": LOG_FILE, "size": size + size1}
+    archives = log_archives()
+    asize = sum(os.path.getsize(a) for a in archives)
+    return {"enabled": logging_enabled(), "file": LOG_FILE, "size": size + asize, "current": size,
+            "archives": len(archives), "archive_size": asize, "policy": log_policy()}
 
 
 def query_logs(p):
@@ -536,21 +577,136 @@ def set_logging(on):
     return {"enabled": logging_enabled()}
 
 
-def rotate(max_mb=LOG_MAX_MB):
-    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) < max_mb * 1024 * 1024:
-        return {"rotated": False}
-    shutil.copyfile(LOG_FILE, LOG_FILE + ".1")
-    with open(LOG_FILE, "r+b") as f:  # sing-box 以 O_APPEND 写入，原地截断安全
-        f.truncate(0)
-    return {"rotated": True}
+LOG_POLICY_DEFAULT = {"max_mb": LOG_MAX_MB, "keep": 5, "compress": True, "retain_days": 30}
+
+
+def log_policy(p=None):
+    """日志策略：单文件上限(MB)、保留归档份数、归档是否 gzip 压缩、归档保留天数(0=不限)。"""
+    pol = dict(LOG_POLICY_DEFAULT)
+    pol.update(load_json(LOG_POLICY_CONF, None) or {})
+    if p:
+        for k in LOG_POLICY_DEFAULT:
+            if k in p and p[k] is not None:
+                pol[k] = p[k]
+        pol["max_mb"] = float(pol["max_mb"])
+        pol["keep"] = int(pol["keep"])
+        pol["compress"] = bool(pol["compress"]) if not isinstance(pol["compress"], str) else pol["compress"] in ("1", "true")
+        pol["retain_days"] = int(pol["retain_days"])
+        if not (1 <= pol["max_mb"] <= 500 and 0 <= pol["keep"] <= 100 and 0 <= pol["retain_days"] <= 3650):
+            raise ValueError("单文件上限需 1~500MB，归档份数 0~100，保留天数 0~3650")
+        write(LOG_POLICY_CONF, json.dumps(pol))
+        rotate()
+    return pol
+
+
+def _archive_pending(pol):
+    """把未压缩的 sing-box.log.1 转为 .1.gz，原有 .N.gz 依次后移。"""
+    plain = LOG_FILE + ".1"
+    if not pol["compress"] or not os.path.exists(plain):
+        return
+    olds = log_archives()[1:] if log_archives()[:1] == [plain] else log_archives()
+    for i in range(len(olds), 0, -1):
+        os.replace("%s.%d.gz" % (LOG_FILE, i), "%s.%d.gz" % (LOG_FILE, i + 1))
+    with open(plain, "rb") as src, gzip.open(LOG_FILE + ".1.gz.tmp", "wb", 6) as dst:
+        shutil.copyfileobj(src, dst)
+    os.replace(LOG_FILE + ".1.gz.tmp", LOG_FILE + ".1.gz")
+    os.remove(plain)
+
+
+def _enforce_archives(pol):
+    removed = 0
+    cutoff = time.time() - pol["retain_days"] * 86400 if pol["retain_days"] else 0
+    for i, path in enumerate(a for a in log_archives() if a.endswith(".gz")):
+        if i >= pol["keep"] or (cutoff and os.path.getmtime(path) < cutoff):
+            os.remove(path)
+            removed += 1
+    return removed
+
+
+def rotate(max_mb=None):
+    pol = log_policy()
+    limit = (max_mb or pol["max_mb"]) * 1024 * 1024
+    rotated = False
+    if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) >= limit:
+        _archive_pending(pol)  # 先归档上一份，避免被覆盖
+        shutil.copyfile(LOG_FILE, LOG_FILE + ".1")
+        with open(LOG_FILE, "r+b") as f:  # sing-box 以 O_APPEND 写入，原地截断安全
+            f.truncate(0)
+        rotated = True
+    _archive_pending(pol)
+    return {"rotated": rotated, "removed": _enforce_archives(pol)}
 
 
 def clear_log():
-    for path in (LOG_FILE, LOG_FILE + ".1"):
-        if os.path.exists(path):
-            with open(path, "r+b") as f:
-                f.truncate(0)
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "r+b") as f:
+            f.truncate(0)
+    for path in log_archives():
+        os.remove(path)
     return {"cleared": True}
+
+
+LINE_TS_RE = re.compile(rb"^(?:[+-]\d{4} )?(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)")
+
+
+def parse_when(v, default=None):
+    """时间参数：秒级时间戳，或服务器本地时间 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM[:SS]'。"""
+    if v in (None, ""):
+        return default
+    if isinstance(v, (int, float)) or re.match(r"^\d{9,11}(\.\d+)?$", str(v)):
+        return float(v)
+    s = str(v).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(s, fmt))
+        except ValueError:
+            pass
+    raise ValueError("时间格式错误：%s（应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM）" % v)
+
+
+def prune_log(p):
+    """删除 [start, end) 时间段内的日志行（按服务器本地时间），涉及当前日志与全部归档。"""
+    start = parse_when(p.get("start"), 0)
+    end = parse_when(p.get("end"))
+    if p.get("days") not in (None, ""):
+        end = time.time() - float(p["days"]) * 86400
+    if end is None:
+        raise ValueError("请指定结束时间 end 或保留天数 days")
+    lo = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start)).encode()
+    hi = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end)).encode()
+    removed = files = 0
+    for path in [LOG_FILE] + log_archives():
+        try:
+            data = _read_file(path)
+        except (OSError, EOFError, zlib.error):
+            continue
+        keep, drop = [], 0
+        for line in data.splitlines(True):
+            m = LINE_TS_RE.match(line)
+            if m and lo <= m.group(1) < hi:
+                drop += 1
+            else:
+                keep.append(line)
+        if not drop:
+            continue
+        removed += drop
+        files += 1
+        out = b"".join(keep)
+        if path == LOG_FILE:
+            with open(path, "r+b") as f:
+                f.seek(0)
+                f.write(out)
+                f.truncate()
+        elif not out:
+            os.remove(path)
+        elif path.endswith(".gz"):
+            with gzip.open(path + ".tmp", "wb", 6) as f:
+                f.write(out)
+            os.replace(path + ".tmp", path)
+        else:
+            with open(path, "wb") as f:
+                f.write(out)
+    return {"removed_lines": removed, "files": files, "range": [fmt_ts(start), fmt_ts(end)]}
 
 
 def raw_log(p):
@@ -884,6 +1040,281 @@ def tg_send(text):
     return rc == 0
 
 
+# ---------------------------------------------------------------- 流量统计
+# 数据来源：sing-box 自带的 Clash API（仅监听 127.0.0.1，随机 secret）。
+# 每 2 秒读取一次活动连接的累计上/下行字节，与服务器总流量对账：
+# 两次采样之间关闭的连接，其未采到的字节按比例归到刚消失的连接，否则记为“短连接(未识别)”，
+# 因此按 IP/网址 汇总的流量之和与服务器总流量一致。按小时聚合写入 SQLite。
+CLASH_RE = re.compile(r',\s*"experimental":\{"clash_api":\{[^{}]*\}\}')
+SHORT_HOST = "(短连接/未识别)"
+
+
+def traffic_conf(p=None):
+    conf = load_json(CLASH_CONF, None) or {}
+    conf.setdefault("retain_days", 90)
+    if p and "retain_days" in p:
+        d = int(p["retain_days"])
+        if not 1 <= d <= 3650:
+            raise ValueError("保留天数需在 1~3650 之间")
+        conf["retain_days"] = d
+        if conf.get("port"):
+            write(CLASH_CONF, json.dumps(conf), 0o600)
+    return conf
+
+
+def traffic_enabled():
+    return "clash_api" in (load_sbjson().get("experimental") or {})
+
+
+def set_traffic(on):
+    if on and sqlite3 is None:
+        raise RuntimeError("当前 python3 缺少 sqlite3 模块，无法启用流量统计")
+    exp = load_sbjson().get("experimental")
+    if on and exp and not CLASH_RE.search(read(os.path.join(SB_DIR, "sb.json"))):
+        raise RuntimeError("配置中已有自定义 experimental 设置，为避免冲突未自动启用")
+    conf = traffic_conf()
+    if on and not conf.get("port"):
+        used = set(inbound_ports())
+        api = load_json(API_CONF, None) or {}
+        if api.get("port"):
+            used.add(int(api["port"]))
+        conf.update(port=free_port(used), secret=secrets.token_hex(16))
+        write(CLASH_CONF, json.dumps(conf), 0o600)
+    snippet = ',"experimental":{"clash_api":{"external_controller":"127.0.0.1:%d","secret":"%s"}}' % (
+        conf.get("port", 0), conf.get("secret", ""))
+    originals, changed = {}, False
+    for path in conf_paths():
+        text = read(path)
+        new = CLASH_RE.sub("", text)
+        if on:
+            i = new.rstrip().rfind("}")  # 插在根对象最后一个 } 之前，同一行，不改变行号
+            new = new[:i] + snippet + new[i:]
+        if new != text:
+            originals[path] = text
+            write(path, new)
+            changed = True
+    if changed:
+        ok, msg = sb_check(os.path.join(SB_DIR, "sb.json"))
+        if not ok:
+            for path, text in originals.items():
+                write(path, text)
+            raise RuntimeError("配置校验失败，已回滚：" + msg[:300])
+        svc_restart("sing-box")
+    return {"enabled": traffic_enabled()}
+
+
+def db_connect():
+    if sqlite3 is None:
+        raise RuntimeError("当前 python3 缺少 sqlite3 模块")
+    con = sqlite3.connect(TRAFFIC_DB, timeout=15)
+    con.execute("CREATE TABLE IF NOT EXISTS traffic(hour INTEGER, src TEXT, host TEXT, inbound TEXT, outbound TEXT,"
+                " up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, conns INTEGER DEFAULT 0,"
+                " PRIMARY KEY(hour, src, host, inbound, outbound))")
+    con.execute("CREATE TABLE IF NOT EXISTS total(hour INTEGER PRIMARY KEY, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_traffic_src ON traffic(src)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_traffic_host ON traffic(host)")
+    return con
+
+
+class TrafficCollector(threading.Thread):
+    INTERVAL = 2
+    FLUSH = 30
+
+    def __init__(self):
+        threading.Thread.__init__(self, daemon=True)
+        self.lock = threading.Lock()
+        self.seen = {}           # 连接ID -> {up, down, key}
+        self.tot = None          # 上次采样的服务器总 (up, down)
+        self.buckets = {}        # (hour, src, host, inbound, outbound) -> [up, down, conns]
+        self.totals = {}         # hour -> [up, down]
+        self.last_flush = time.time()
+        self.error = ""
+
+    def fetch(self, conf):
+        req = urllib.request.Request("http://127.0.0.1:%d/connections" % conf["port"],
+                                     headers={"Authorization": "Bearer " + conf["secret"]})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def sample(self, data, now=None):
+        hour = int((now or time.time()) // 3600 * 3600)
+        up_t, down_t = int(data.get("uploadTotal") or 0), int(data.get("downloadTotal") or 0)
+        cur = {}
+        for c in data.get("connections") or []:
+            md = c.get("metadata") or {}
+            chains = c.get("chains") or []
+            key = (norm_ip(str(md.get("sourceIP") or "")), str(md.get("host") or md.get("destinationIP") or ""),
+                   str(md.get("type") or ""), str(chains[0]) if chains else "")
+            cur[str(c.get("id"))] = {"up": int(c.get("upload") or 0), "down": int(c.get("download") or 0), "key": key}
+        with self.lock:
+            if self.tot is None:  # 首次采样只建立基线，避免重复计入采集器启动前的流量
+                self.tot, self.seen = (up_t, down_t), cur
+                return
+            restarted = up_t < self.tot[0] or down_t < self.tot[1]  # sing-box 重启后计数清零
+            gu = up_t if restarted else up_t - self.tot[0]
+            gd = down_t if restarted else down_t - self.tot[1]
+            au = ad = 0
+            for cid, c in cur.items():
+                prev = None if restarted else self.seen.get(cid)
+                du = max(0, c["up"] - prev["up"]) if prev else c["up"]
+                dd = max(0, c["down"] - prev["down"]) if prev else c["down"]
+                self._add(hour, c["key"], du, dd, 0 if prev else 1)
+                au += du
+                ad += dd
+            # 两次采样之间关闭的连接：用总流量差额对账
+            ru, rd = max(0, gu - au), max(0, gd - ad)
+            gone = [] if restarted else [v for k, v in self.seen.items() if k not in cur]
+            if ru or rd:
+                if gone:
+                    wu = sum(v["up"] for v in gone) or len(gone)
+                    wd = sum(v["down"] for v in gone) or len(gone)
+                    for v in gone:
+                        self._add(hour, v["key"], ru * (v["up"] or 1) // wu, rd * (v["down"] or 1) // wd, 0)
+                else:
+                    self._add(hour, ("-", SHORT_HOST, "", ""), ru, rd, 0)
+            t = self.totals.setdefault(hour, [0, 0])
+            t[0] += gu
+            t[1] += gd
+            self.tot, self.seen = (up_t, down_t), cur
+
+    def _add(self, hour, key, du, dd, conns):
+        if not (du or dd or conns):
+            return
+        b = self.buckets.setdefault((hour,) + key, [0, 0, 0])
+        b[0] += du
+        b[1] += dd
+        b[2] += conns
+
+    def flush(self):
+        with self.lock:
+            buckets, totals = self.buckets, self.totals
+            self.buckets, self.totals = {}, {}
+            self.last_flush = time.time()
+        if not buckets and not totals:
+            return
+        con = db_connect()
+        try:
+            with con:
+                for k, (u, d, n) in buckets.items():
+                    con.execute("INSERT OR IGNORE INTO traffic(hour,src,host,inbound,outbound) VALUES(?,?,?,?,?)", k)
+                    con.execute("UPDATE traffic SET up=up+?, down=down+?, conns=conns+? WHERE hour=? AND src=? AND host=?"
+                                " AND inbound=? AND outbound=?", (u, d, n) + k)
+                for h, (u, d) in totals.items():
+                    con.execute("INSERT OR IGNORE INTO total(hour) VALUES(?)", (h,))
+                    con.execute("UPDATE total SET up=up+?, down=down+? WHERE hour=?", (u, d, h))
+        finally:
+            con.close()
+
+    def run(self):
+        while True:
+            try:
+                conf = traffic_conf()
+                if conf.get("port") and traffic_enabled():
+                    self.sample(self.fetch(conf))
+                    self.error = ""
+                else:
+                    self.tot = None
+                    time.sleep(10)
+            except Exception as e:  # sing-box 重启或未就绪
+                self.error = str(e)[:200]
+                with self.lock:
+                    self.tot = None
+            if time.time() - self.last_flush >= self.FLUSH:
+                try:
+                    self.flush()
+                except Exception as e:
+                    self.error = "flush: %s" % e
+            time.sleep(self.INTERVAL)
+
+
+COLLECTOR = None  # serve 模式下启用
+
+TRAFFIC_GROUPS = {
+    "ip": "src", "host": "host", "inbound": "inbound", "outbound": "outbound",
+    "ip_host": "src || ' -> ' || host",
+    "day": "strftime('%Y-%m-%d', hour, 'unixepoch', 'localtime')",
+    "hour": "strftime('%Y-%m-%d %H:00', hour, 'unixepoch', 'localtime')",
+}
+
+
+def traffic_range(p):
+    end = parse_when(p.get("end"), time.time())
+    if p.get("hours") not in (None, ""):
+        start = end - float(p["hours"]) * 3600
+    else:
+        start = parse_when(p.get("start"), end - 86400)
+    if start >= end:
+        raise ValueError("开始时间需早于结束时间")
+    return int(start // 3600 * 3600), end
+
+
+def query_traffic(p):
+    if COLLECTOR is not None:
+        COLLECTOR.flush()
+    if not os.path.exists(TRAFFIC_DB):
+        return {"enabled": traffic_enabled(), "rows": [], "total": {"up": 0, "down": 0},
+                "matched": {"up": 0, "down": 0, "conns": 0}, "range": []}
+    start, end = traffic_range(p)
+    group = p.get("group") or "ip"
+    if group not in TRAFFIC_GROUPS:
+        raise ValueError("group 只能是：" + ",".join(TRAFFIC_GROUPS))
+    where, args = ["hour >= ?", "hour < ?"], [start, end]
+    for field, col in (("ip", "src"), ("host", "host"), ("inbound", "inbound"), ("outbound", "outbound")):
+        v = str(p.get(field) or "").strip()
+        if v:
+            where.append("%s LIKE ? ESCAPE '\\'" % col)
+            args.append("%" + v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    limit = max(1, min(int(p.get("limit") or 200), 5000))
+    key = TRAFFIC_GROUPS[group]
+    order = "k" if group in ("day", "hour") else "(up + down) DESC"
+    w = " AND ".join(where)
+    con = db_connect()
+    try:
+        rows = con.execute("SELECT %s AS k, SUM(up) AS up, SUM(down) AS down, SUM(conns), COUNT(DISTINCT src),"
+                           " COUNT(DISTINCT host), MIN(hour), MAX(hour) FROM traffic WHERE %s GROUP BY k ORDER BY %s LIMIT ?"
+                           % (key, w, order), args + [limit]).fetchall()
+        m = con.execute("SELECT SUM(up), SUM(down), SUM(conns) FROM traffic WHERE " + w, args).fetchone()
+        t = con.execute("SELECT SUM(up), SUM(down) FROM total WHERE hour >= ? AND hour < ?", (start, end)).fetchone()
+    finally:
+        con.close()
+    return {
+        "enabled": traffic_enabled(), "group": group, "range": [fmt_ts(start), fmt_ts(end)],
+        "rows": [{"key": r[0], "up": r[1] or 0, "down": r[2] or 0, "conns": r[3] or 0, "ips": r[4], "hosts": r[5],
+                  "first": fmt_ts(r[6]), "last": fmt_ts(r[7] + 3599)} for r in rows],
+        "matched": {"up": m[0] or 0, "down": m[1] or 0, "conns": m[2] or 0},
+        "total": {"up": t[0] or 0, "down": t[1] or 0},
+        "collector": COLLECTOR.error if COLLECTOR is not None else None,
+    }
+
+
+def purge_traffic(p):
+    """删除 [start, end) 时间段的流量记录；只给 days 时删除 days 天以前的全部记录。"""
+    if p.get("days") not in (None, ""):
+        start, end = 0, time.time() - float(p["days"]) * 86400
+    else:
+        start, end = parse_when(p.get("start"), 0), parse_when(p.get("end"))
+        if end is None:
+            raise ValueError("请指定结束时间 end 或保留天数 days")
+    if not os.path.exists(TRAFFIC_DB):
+        return {"removed": 0}
+    con = db_connect()
+    try:
+        with con:
+            n = con.execute("DELETE FROM traffic WHERE hour >= ? AND hour < ?", (start, end)).rowcount
+            con.execute("DELETE FROM total WHERE hour >= ? AND hour < ?", (start, end))
+        con.execute("VACUUM")
+    finally:
+        con.close()
+    return {"removed": n, "range": [fmt_ts(start), fmt_ts(end)], "db_size": os.path.getsize(TRAFFIC_DB)}
+
+
+def traffic_info():
+    return {"enabled": traffic_enabled(), "available": sqlite3 is not None,
+            "db_size": os.path.getsize(TRAFFIC_DB) if os.path.exists(TRAFFIC_DB) else 0,
+            "retain_days": traffic_conf().get("retain_days"),
+            "collector": (COLLECTOR.error or "ok") if COLLECTOR is not None else None}
+
+
 # ---------------------------------------------------------------- 状态
 _VER_CACHE = {}
 
@@ -927,6 +1358,7 @@ def status(_p=None):
         "server_ip": read(os.path.join(SB_DIR, "server_ip.log")).strip(),
         "inbounds": inbounds, "argo": argo, "log": log_info(), "last_reset": last_reset(),
         "schedule": cron_get("sbagent.py reset --cron"), "leak": leak_conf(), "time": fmt_ts(time.time()),
+        "traffic": traffic_info(), "api": api_public(),
     }
 
 
@@ -981,33 +1413,109 @@ def unseal(env, keys):
     return json.loads(pt.decode())
 
 
+# 动作 -> (所需权限, 处理函数)。权限：read 只读查看；links 查看节点/订阅链接；manage 修改与重置。
+# 注意：没有任何动作可以执行任意命令、修改 API 权限/白名单/Token，这些只能在 VPS 上通过 sb 菜单修改，
+# 即使 Token 泄露，对方也无法借此控制 VPS 或提升权限。
 ACTIONS = {
-    "ping": lambda p: {"pong": True, "agent": VERSION},
-    "status": status,
-    "logs": query_logs,
-    "stats": query_stats,
-    "peers": query_peers,
-    "rawlog": raw_log,
-    "links": get_links,
-    "reset": lambda p: do_reset(p.get("items") or "all"),
-    "restart": lambda p: {"rc": svc_restart("sing-box")[0], "active": svc_active("sing-box")},
-    "logon": lambda p: set_logging(True),
-    "logoff": lambda p: set_logging(False),
-    "clearlog": lambda p: clear_log(),
-    "schedule": schedule,
-    "leakconf": lambda p: leak_conf(p or None),
-    "leakcheck": lambda p: leak_check(False),
+    "ping": (None, lambda p: {"pong": True, "agent": VERSION}),
+    "status": ("read", status),
+    "logs": ("read", query_logs),
+    "stats": ("read", query_stats),
+    "peers": ("read", query_peers),
+    "rawlog": ("read", raw_log),
+    "leakcheck": ("read", lambda p: leak_check(False)),
+    "traffic": ("read", query_traffic),
+    "apilog": ("read", lambda p: api_log_read(p)),
+    "links": ("links", get_links),
+    "reset": ("manage", lambda p: do_reset(p.get("items") or "all")),
+    "restart": ("manage", lambda p: {"rc": svc_restart("sing-box")[0], "active": svc_active("sing-box")}),
+    "logon": ("manage", lambda p: set_logging(True)),
+    "logoff": ("manage", lambda p: set_logging(False)),
+    "clearlog": ("manage", lambda p: clear_log()),
+    "logprune": ("manage", prune_log),
+    "logpolicy": ("manage", lambda p: log_policy(p or None)),
+    "schedule": ("manage", schedule),
+    "leakconf": ("manage", lambda p: leak_conf(p or None)),
+    "trafficon": ("manage", lambda p: set_traffic(True)),
+    "trafficoff": ("manage", lambda p: set_traffic(False)),
+    "trafficpurge": ("manage", purge_traffic),
+    "trafficconf": ("manage", lambda p: traffic_conf(p or None)),
 }
+PERMS = ("read", "links", "manage")
+MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog"}
+QUIET = {"ping", "status", "logs", "stats", "peers", "rawlog", "traffic", "apilog"}  # 高频只读动作不写审计日志
+
+
+def api_log(entry):
+    entry["time"] = fmt_ts(time.time())
+    try:
+        if os.path.exists(API_LOG) and os.path.getsize(API_LOG) > 2 * 1024 * 1024:
+            os.replace(API_LOG, API_LOG + ".1")
+        with open(API_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def api_log_read(p):
+    n = max(1, min(int(p.get("lines") or 200), 2000))
+    lines = collections.deque(read(API_LOG).splitlines(), maxlen=n)
+    return {"entries": [e for e in (load_json_str(l) for l in reversed(lines)) if e]}
+
+
+def ip_in(ip, nets):
+    try:
+        addr = ipaddress.ip_address(norm_ip(ip))
+    except ValueError:
+        return False
+    for n in nets:
+        try:
+            if addr in ipaddress.ip_network(n, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 class Api(object):
+    BAN_FAILS = 10       # 10 分钟内认证失败次数
+    BAN_SECONDS = 3600
+
     def __init__(self, conf):
         self.conf = conf
         self.keys = derive_keys(conf["token"])
         self.path = conf.get("path") or "/api"
+        self.perms = set(conf.get("perms") or PERMS)
+        self.allow = list(conf.get("allow") or [])
+        self.reset_interval = int(conf.get("reset_interval", 600))
         self.nonces = {}
+        self.fails = {}
+        self.banned = {}
         self.lock = threading.Lock()
         self.reset_lock = threading.Lock()
+
+    def permitted_ip(self, ip):
+        """白名单与封禁检查，在读取请求体之前进行。"""
+        now = time.time()
+        with self.lock:
+            until = self.banned.get(ip)
+            if until and until > now:
+                return False
+            if until:
+                del self.banned[ip]
+        return not self.allow or ip_in(ip, self.allow)
+
+    def record_fail(self, ip, reason):
+        now = time.time()
+        with self.lock:
+            lst = [t for t in self.fails.get(ip, []) if now - t < 600] + [now]
+            self.fails[ip] = lst
+            if len(lst) >= self.BAN_FAILS:
+                self.banned[ip] = now + self.BAN_SECONDS
+                self.fails.pop(ip, None)
+                api_log({"ip": ip, "action": "-", "ok": False, "error": "认证失败过多，封禁%d分钟" % (self.BAN_SECONDS // 60)})
+            if len(self.fails) > 10000:
+                self.fails.clear()
 
     def check_replay(self, req):
         now = time.time()
@@ -1023,22 +1531,36 @@ class Api(object):
             self.nonces[nonce] = now
         return nonce
 
-    def handle(self, body):
+    def handle(self, body, ip="-"):
         req = unseal(json.loads(body.decode()), self.keys)
         nonce = self.check_replay(req)
-        action = req.get("action")
-        fn = ACTIONS.get(action)
+        action = str(req.get("action"))
+        params = req.get("params")
+        params = params if isinstance(params, dict) else {}
         try:
-            if fn is None:
+            spec = ACTIONS.get(action)
+            if spec is None:
                 raise ValueError("未知操作: %s" % action)
-            if action in ("reset", "logon", "logoff", "restart"):
+            need, fn = spec
+            if need and need not in self.perms:
+                raise PermissionError("权限不足：此 Token 未授予 %s 权限（在 VPS 上运行 sb 选 19 修改）" % need)
+            if action in MUTATING:
                 with self.reset_lock:
-                    data = fn(req.get("params") or {})
+                    if action == "reset":
+                        last = last_reset()
+                        left = self.reset_interval - (time.time() - time.mktime(
+                            time.strptime(last["time"], "%Y-%m-%d %H:%M:%S"))) if last else 0
+                        if left > 0:
+                            raise RuntimeError("重置过于频繁，请 %d 秒后再试（防止被滥用）" % left)
+                    data = fn(params)
             else:
-                data = fn(req.get("params") or {})
+                data = fn(params)
             resp = {"ok": True, "data": data}
         except Exception as e:  # 业务错误加密返回给面板
             resp = {"ok": False, "error": str(e)}
+        if action not in QUIET or not resp["ok"]:
+            api_log({"ip": ip, "action": action, "ok": resp["ok"], "error": resp.get("error", "")[:200],
+                     "params": {k: v for k, v in params.items() if k in ("items", "mode", "start", "end", "days")}})
         resp.update(rn=nonce, ts=int(time.time()))
         return json.dumps(seal(resp, self.keys)).encode()
 
@@ -1067,14 +1589,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         api = self.server.api
-        n = int(self.headers.get("Content-Length") or 0)
+        ip = norm_ip(self.client_address[0])
+        if not api.permitted_ip(ip):
+            return self.do_GET()
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
         if self.path != api.path or n <= 0 or n > 2 * 1024 * 1024:
+            api.record_fail(ip, "path")
             return self.do_GET()
         body = self.rfile.read(n)
         try:
-            out = api.handle(body)
+            out = api.handle(body, ip)
         except Exception as e:
-            sys.stderr.write("sbagent: reject %s: %s\n" % (self.client_address[0], e))
+            api.record_fail(ip, str(e))
+            sys.stderr.write("sbagent: reject %s: %s\n" % (ip, e))
             return self.do_GET()
         self.reply(200, out, "application/json")
 
@@ -1111,13 +1641,25 @@ def serve():
     conf = load_json(API_CONF)
     if not conf or not conf.get("token"):
         sys.exit("未初始化API，请先执行：sbagent.py apiinit")
-    global LOG_INDEX
+    global LOG_INDEX, COLLECTOR
     LOG_INDEX = LogIndex()
+    if sqlite3 is not None:
+        COLLECTOR = TrafficCollector()
+        COLLECTOR.start()
 
     def janitor():
+        n = 0
         while True:
             time.sleep(60)
+            n += 1
             LOG_INDEX.drop_if_idle()
+            try:
+                if n % 5 == 0:  # 每5分钟按日志策略轮转/压缩/清理
+                    rotate()
+                if n % 1440 == 1 and os.path.exists(TRAFFIC_DB):  # 每天按保留天数清理流量记录
+                    purge_traffic({"days": traffic_conf().get("retain_days", 90)})
+            except Exception as e:
+                sys.stderr.write("sbagent janitor: %s\n" % e)
     threading.Thread(target=janitor, daemon=True).start()
     srv = make_server(conf)
     sys.stderr.write("sbagent %s API listening on %s:%s%s\n" % (VERSION, conf.get("listen") or "::",
@@ -1126,23 +1668,79 @@ def serve():
 
 
 # ---------------------------------------------------------------- API 服务安装
-def api_init(port=None, regen=False):
+def parse_perms(v):
+    perms = [x.strip() for x in (v.split(",") if isinstance(v, str) else v) if x.strip()]
+    bad = [x for x in perms if x not in PERMS]
+    if bad or not perms:
+        raise ValueError("权限只能是 read,links,manage 的组合（至少 read）")
+    if "read" not in perms:
+        perms.insert(0, "read")
+    return [x for x in PERMS if x in perms]
+
+
+def parse_allow(v):
+    nets = [x.strip() for x in (re.split(r"[\s,，]+", v) if isinstance(v, str) else v) if x.strip()]
+    for n in nets:
+        try:
+            ipaddress.ip_network(n, strict=False)
+        except ValueError:
+            raise ValueError("白名单格式错误：%s（应为 IP 或 CIDR，如 1.2.3.4 或 1.2.3.0/24）" % n)
+    return nets
+
+
+def api_init(port=None, regen=False, perms=None, allow=None, reset_interval=None):
     conf = load_json(API_CONF, None) or {}
     if port:
-        conf["port"] = int(port)
+        port = int(port)
+        if not 1 <= port <= 65535:
+            raise ValueError("端口需在 1~65535 之间")
+        conf["port"] = port
     if not conf.get("port"):
         used = set(inbound_ports())
         conf["port"] = free_port(used)
     if regen or not conf.get("token"):
         conf["token"] = secrets.token_urlsafe(32)
+    if perms is not None:
+        conf["perms"] = parse_perms(perms)
+    if allow is not None:
+        conf["allow"] = parse_allow(allow)
+    if reset_interval is not None:
+        conf["reset_interval"] = max(0, int(reset_interval))
+    conf.setdefault("perms", list(PERMS))
+    conf.setdefault("allow", [])
+    conf.setdefault("reset_interval", 600)
     conf.setdefault("path", "/" + secrets.token_hex(6))
     conf.setdefault("listen", "::")
     write(API_CONF, json.dumps(conf, indent=2), 0o600)
     return conf
 
 
-def api_install(port=None, regen=False):
-    conf = api_init(port, regen)
+def api_restart():
+    if is_alpine():
+        runs(["rc-service", "sbagent", "restart"])
+    elif os.path.exists("/etc/systemd/system/sbagent.service"):
+        runs(["systemctl", "restart", "sbagent"])
+
+
+def api_set(perms=None, allow=None, reset_interval=None):
+    """仅限 VPS 本机命令行调用：修改权限/白名单/重置间隔（API 中没有对应动作）。"""
+    if not load_json(API_CONF, None):
+        raise RuntimeError("API 未安装")
+    api_init(perms=perms, allow=allow, reset_interval=reset_interval)
+    api_restart()
+    return api_info()
+
+
+def api_public():
+    conf = load_json(API_CONF, None)
+    if not conf:
+        return None
+    return {"perms": conf.get("perms") or list(PERMS), "allow": conf.get("allow") or [],
+            "reset_interval": conf.get("reset_interval", 600)}
+
+
+def api_install(port=None, regen=False, perms=None, allow=None):
+    conf = api_init(port, regen, perms, allow)
     me = os.path.abspath(__file__)
     py = sys.executable or "/usr/bin/python3"
     if is_alpine():
@@ -1186,7 +1784,8 @@ def api_info():
         return None
     host = read(os.path.join(SB_DIR, "server_ip.log")).strip().strip("[]") or socket.gethostname()
     return {"name": socket.gethostname(), "host": host, "port": conf["port"], "path": conf.get("path", "/api"),
-            "token": conf["token"], "running": svc_active("sbagent")}
+            "token": conf["token"], "running": svc_active("sbagent"), "perms": conf.get("perms") or list(PERMS),
+            "allow": conf.get("allow") or [], "reset_interval": conf.get("reset_interval", 600)}
 
 
 # ---------------------------------------------------------------- 命令行
@@ -1227,6 +1826,27 @@ def print_stats(res, mode):
             print("%-50s %7d %6d  %s" % (trunc(d["host"], 50), d["count"], d["ips"], d["last"]))
 
 
+def fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.2f %s") % (n, unit)
+        n /= 1024.0
+
+
+def print_traffic(res):
+    if not res.get("enabled"):
+        print("流量统计未开启（菜单 17 中开启）")
+    t, m = res["total"], res["matched"]
+    print("时间范围：%s ~ %s" % tuple(res["range"] or ("-", "-")))
+    print("服务器总流量：上行 %s  下行 %s ；筛选结果：上行 %s  下行 %s  连接 %d" % (
+        fmt_bytes(t["up"]), fmt_bytes(t["down"]), fmt_bytes(m["up"]), fmt_bytes(m["down"]), m["conns"]))
+    print("\n%-46s %12s %12s %12s %7s" % ("分组", "上行", "下行", "合计", "连接"))
+    for r in res["rows"]:
+        print("%-46s %12s %12s %12s %7d" % (trunc(r["key"], 46), fmt_bytes(r["up"]), fmt_bytes(r["down"]),
+                                             fmt_bytes(r["up"] + r["down"]), r["conns"]))
+
+
 def main():
     ap = argparse.ArgumentParser(description="sing-box-yg agent %s" % VERSION)
     sp = ap.add_subparsers(dest="cmd")
@@ -1251,8 +1871,39 @@ def main():
     sp.add_parser("logoff")
     sp.add_parser("logstatus")
     p = sp.add_parser("rotate")
-    p.add_argument("--max-mb", type=float, default=LOG_MAX_MB)
+    p.add_argument("--max-mb", type=float)
     sp.add_parser("clearlog")
+    p = sp.add_parser("logpolicy", help="日志策略：单文件上限/归档份数/压缩/保留天数")
+    p.add_argument("--max-mb", type=float)
+    p.add_argument("--keep", type=int)
+    p.add_argument("--compress", choices=("0", "1"))
+    p.add_argument("--retain-days", type=int)
+    p = sp.add_parser("logprune", help="按时间段删除日志：--start/--end 或 --days")
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--days", type=float, help="删除 N 天以前的日志")
+    p = sp.add_parser("traffic", help="流量统计查询")
+    p.add_argument("--by", choices=sorted(TRAFFIC_GROUPS), default="ip")
+    p.add_argument("--hours", type=float)
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--ip")
+    p.add_argument("--host")
+    p.add_argument("--inbound")
+    p.add_argument("--limit", type=int, default=30)
+    p.add_argument("--json", action="store_true")
+    sp.add_parser("trafficon")
+    sp.add_parser("trafficoff")
+    p = sp.add_parser("trafficpurge", help="删除流量记录：--start/--end 或 --days")
+    p.add_argument("--start")
+    p.add_argument("--end")
+    p.add_argument("--days", type=float)
+    p = sp.add_parser("apiset", help="修改API权限/白名单/重置间隔（仅本机）")
+    p.add_argument("--perms", help="read,links,manage 的组合")
+    p.add_argument("--allow", help="IP/CIDR，逗号分隔；传空字符串表示不限制")
+    p.add_argument("--reset-interval", type=int, help="两次API重置的最小间隔(秒)")
+    p = sp.add_parser("apilog", help="API访问审计日志")
+    p.add_argument("--lines", type=int, default=50)
     p = sp.add_parser("schedule", help="定时重置：off|daily|weekly")
     p.add_argument("mode", nargs="?")
     p.add_argument("items", nargs="?", default="all")
@@ -1271,6 +1922,8 @@ def main():
     p = sp.add_parser("apiinstall")
     p.add_argument("--port", type=int)
     p.add_argument("--regen", action="store_true")
+    p.add_argument("--perms")
+    p.add_argument("--allow")
     sp.add_parser("apiuninstall")
     sp.add_parser("apiinfo")
     a = ap.parse_args()
@@ -1298,6 +1951,28 @@ def main():
         rotate(a.max_mb)
     elif a.cmd == "clearlog":
         out(clear_log())
+    elif a.cmd == "logpolicy":
+        p = {"max_mb": a.max_mb, "keep": a.keep, "retain_days": a.retain_days,
+             "compress": None if a.compress is None else a.compress == "1"}
+        out(log_policy(p if any(v is not None for v in p.values()) else None))
+    elif a.cmd == "logprune":
+        out(prune_log({"start": a.start, "end": a.end, "days": a.days}))
+    elif a.cmd == "traffic":
+        res = query_traffic({"group": a.by, "hours": a.hours, "start": a.start, "end": a.end, "ip": a.ip,
+                             "host": a.host, "inbound": a.inbound, "limit": a.limit})
+        out(res) if a.json else print_traffic(res)
+    elif a.cmd == "trafficon":
+        out(set_traffic(True))
+    elif a.cmd == "trafficoff":
+        out(set_traffic(False))
+    elif a.cmd == "trafficpurge":
+        out(purge_traffic({"start": a.start, "end": a.end, "days": a.days}))
+    elif a.cmd == "apiset":
+        out(api_set(a.perms, a.allow, a.reset_interval))
+    elif a.cmd == "apilog":
+        for e in api_log_read({"lines": a.lines})["entries"]:
+            print("%s  %-40s %-12s %s %s" % (e.get("time"), e.get("ip"), e.get("action"),
+                                            "✔" if e.get("ok") else "✘", e.get("error") or ""))
     elif a.cmd == "schedule":
         out(schedule({"mode": a.mode, "items": a.items} if a.mode else {}))
     elif a.cmd == "leakconf":
@@ -1319,7 +1994,7 @@ def main():
     elif a.cmd == "serve":
         serve()
     elif a.cmd == "apiinstall":
-        out(api_install(a.port, a.regen))
+        out(api_install(a.port, a.regen, a.perms, a.allow))
     elif a.cmd == "apiuninstall":
         out(api_uninstall())
     elif a.cmd == "apiinfo":
