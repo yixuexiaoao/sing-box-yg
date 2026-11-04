@@ -184,18 +184,92 @@ wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cu
 wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
 }
 
+# ---------------------------------------------------------------- 系统 DNS（纯IPv6 VPS 的 NAT64/DNS64）
+# 原逻辑：只要 `curl -4 icanhazip.com` 没有返回（这个请求本身依赖DNS，网络抖动/DNS暂时故障也会失败），
+# 就把 /etc/resolv.conf 覆盖为两个仅IPv6的 NAT64 DNS，且不备份。IPv4 VPS 上一旦误判，所有域名都无法解析，
+# 之后再运行脚本又因解析失败继续误判，无法自行恢复。现在：
+#   1. 判断网络栈不依赖DNS：看默认路由，并直接访问IP地址；只有「没有可用IPv4、IPv6可用」才算纯IPv6
+#   2. 纯IPv6时先看现有DNS能否访问仅IPv4的域名（github.com），能则不修改
+#   3. 修改前备份；NAT64 DNS 放前面并保留原有的IPv6 DNS作为后备；修改后实测，不通则恢复备份
+#   4. 有IPv4却发现 resolv.conf 是本脚本（或旧版本）写入的仅NAT64 DNS 时自动恢复；卸载时恢复
+SBRESOLV=${SBRESOLV:-/etc/resolv.conf}
+SBDNS_BAK="$SBRESOLV.sbyg.bak"
+SBDNS_MARK="# sing-box-yg: NAT64 DNS (backup: $SBDNS_BAK)"
+SBDNS_NAT64="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
+sbnet4(){
+ip -4 route show default 2>/dev/null | grep -q . || return 1
+curl -s4m5 -o /dev/null https://1.1.1.1/cdn-cgi/trace 2>/dev/null || curl -s4m5 -k -o /dev/null https://9.9.9.9 2>/dev/null || curl -s4m5 -k -o /dev/null icanhazip.com 2>/dev/null
+}
+sbnet6(){
+curl -s6m5 -o /dev/null "https://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null || curl -s6m5 -k -o /dev/null "https://[2620:fe::fe]" 2>/dev/null
+}
+# 只含 NAT64 DNS 的 resolv.conf（本脚本写入，或旧版本写入的两行）
+sbdns_isnat64(){
+[[ -f $SBRESOLV ]] || return 1
+grep -qF "$SBDNS_MARK" $SBRESOLV && return 0
+local ns x; ns=$(awk '$1=="nameserver"{print $2}' $SBRESOLV)
+[[ -n $ns ]] || return 1
+for x in $ns; do [[ " $SBDNS_NAT64 " == *" $x "* ]] || return 1; done
+}
+sbdns_restore(){
+sbdns_isnat64 || return 0
+if [[ -L $SBDNS_BAK.link ]]; then
+rm -f $SBRESOLV && cp -P "$SBDNS_BAK.link" $SBRESOLV
+elif [[ -s $SBDNS_BAK ]]; then
+cat "$SBDNS_BAK" > $SBRESOLV
+else
+# 旧版本覆盖时没有备份：改为公共DNS（IPv4 + IPv6）
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 2606:4700:4700::1111\n' > $SBRESOLV
+fi
+rm -f "$SBDNS_BAK" "$SBDNS_BAK.link"
+yellow "已恢复系统DNS（$SBRESOLV）"
+}
+sbdns_nat64(){
+# 现有DNS已能访问仅IPv4的站点（服务商自带DNS64等），不做修改
+curl -s6m8 -o /dev/null https://github.com 2>/dev/null && return 0
+if [[ ! -e $SBDNS_BAK && ! -L $SBDNS_BAK.link ]]; then
+if [[ -L $SBRESOLV ]]; then cp -P $SBRESOLV "$SBDNS_BAK.link"; else cp -f $SBRESOLV "$SBDNS_BAK" 2>/dev/null; fi
+fi
+local old x new
+old=$(awk '$1=="nameserver" && $2 ~ /:/ {print $2}' $SBRESOLV 2>/dev/null)
+new="$SBDNS_MARK"$'\n'"nameserver 2a00:1098:2b::1"$'\n'"nameserver 2a00:1098:2c::1"
+for x in $old; do [[ " $SBDNS_NAT64 " == *" $x "* ]] || { new+=$'\n'"nameserver $x"; break; }; done
+rm -f $SBRESOLV && printf '%s\n' "$new" > $SBRESOLV
+if curl -s6m8 -o /dev/null https://github.com 2>/dev/null; then
+yellow "检测到 纯IPV6 VPS，已添加NAT64 DNS（原配置备份于 $SBDNS_BAK，卸载时恢复）"
+else
+sbdns_restore >/dev/null
+red "纯IPV6 VPS：NAT64 DNS 不可用，已恢复原DNS配置；如无法访问Github，请向VPS商家咨询DNS64/NAT64"
+fi
+}
+# 删除 nat PREROUTING 中 DNAT 到指定 udp 端口的规则（端口跳跃），IPv4 与 IPv6
+sbunhop(){
+local p t r
+for p in $1; do
+for t in iptables ip6tables; do
+command -v $t >/dev/null 2>&1 || continue
+$t -t nat -S PREROUTING 2>/dev/null | grep -E -- "-p udp .*-j DNAT --to-destination :$p\$" | sed 's/^-A /-D /' | while read -r r; do
+$t -t nat $r >/dev/null 2>&1
+done
+done
+done
+}
 v6(){
 v4orv6(){
-if [ -z "$(curl -s4m5 icanhazip.com -k)" ]; then
+if sbnet4; then
+ipv=prefer_ipv4
+sbdns_restore
+elif sbnet6; then
 echo
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-yellow "检测到 纯IPV6 VPS，添加NAT64"
-echo -e "nameserver 2a00:1098:2b::1\nnameserver 2a00:1098:2c::1" > /etc/resolv.conf
 ipv=prefer_ipv6
+sbdns_nat64
 else
+# IPv4、IPv6 都检测不到（网络暂时故障）：不修改系统DNS
 ipv=prefer_ipv4
+yellow "未能检测到可用的 IPv4/IPv6 网络，未修改系统DNS"
 fi
-if [ -n "$(curl -s6m5 icanhazip.com -k)" ]; then
+if sbnet6; then
 endip="2606:4700:d0::a29f:c001"
 else
 endip="162.159.192.1"
@@ -220,18 +294,27 @@ systemctl stop firewalld.service >/dev/null 2>&1
 systemctl disable firewalld.service >/dev/null 2>&1
 setenforce 0 >/dev/null 2>&1
 ufw disable >/dev/null 2>&1
-iptables -P INPUT ACCEPT >/dev/null 2>&1
-iptables -P FORWARD ACCEPT >/dev/null 2>&1
-iptables -P OUTPUT ACCEPT >/dev/null 2>&1
-iptables -t mangle -F >/dev/null 2>&1
-iptables -F >/dev/null 2>&1
-iptables -X >/dev/null 2>&1
+# 开放入站端口：只放开 INPUT/OUTPUT（IPv4 与 IPv6）。
+# 原先 `iptables -F`、`-X`、`-t mangle -F` 会清空所有链并删除自定义链（Docker 的 DOCKER/DOCKER-USER 等、
+# WARP/WireGuard 的策略路由标记），导致容器网络与其它服务中断；IPv6 防火墙则完全没有处理（纯IPv6 VPS 端口仍不通）
+local t
+for t in iptables ip6tables; do
+command -v $t >/dev/null 2>&1 || continue
+$t -P INPUT ACCEPT >/dev/null 2>&1
+$t -P OUTPUT ACCEPT >/dev/null 2>&1
+$t -F INPUT >/dev/null 2>&1
+$t -F OUTPUT >/dev/null 2>&1
+# 没有 Docker 时保持原版行为放开转发；有 Docker 时其 FORWARD 规则/策略由 Docker 管理，不改动
+if ! $t -S 2>/dev/null | grep -q -- '-N DOCKER'; then
+$t -P FORWARD ACCEPT >/dev/null 2>&1
+fi
+done
 netfilter-persistent save >/dev/null 2>&1
-if [[ -n $(apachectl -v 2>/dev/null) ]]; then
-systemctl stop httpd.service >/dev/null 2>&1
-systemctl disable httpd.service >/dev/null 2>&1
-service apache2 stop >/dev/null 2>&1
-systemctl disable apache2 >/dev/null 2>&1
+service iptables save >/dev/null 2>&1
+service ip6tables save >/dev/null 2>&1
+# 原先只要安装了 Apache 就停止并禁用（会关掉VPS上正在运行的网站）；现在只在其占用80端口时提示（申请证书需要80端口）
+if [[ -n $(apachectl -v 2>/dev/null) ]] && ss -ltnp 2>/dev/null | grep -E ':80 ' | grep -qE 'apache|httpd'; then
+yellow "提示：Apache 正在占用80端口，如需用80端口申请域名证书，请先自行停止 Apache"
 fi
 sleep 1
 green "执行开放端口，关闭防火墙完毕"
@@ -4096,13 +4179,16 @@ systemctl disable "$svc" >/dev/null 2>&1
 done
 rm -rf /etc/systemd/system/{sing-box.service,argo.service,sbagent.service}
 fi
+sbhops=$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '.inbounds[2].listen_port, .inbounds[3].listen_port' 2>/dev/null | grep -E '^[0-9]+$')
 ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '.inbounds[1].listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
 rm -rf /etc/s-box sbyg_update /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
 rm -f /etc/local.d/alpineargo.start /etc/local.d/alpinesub.start /etc/local.d/alpinews5.start
 uncronsb
-iptables -t nat -F PREROUTING >/dev/null 2>&1
+# 只删除指向 Hy2/Tuic 端口的端口跳跃规则（原先清空整个 nat PREROUTING 链，会删掉 Docker 等其它程序的规则）
+sbunhop "$sbhops"
+sbdns_restore
 netfilter-persistent save >/dev/null 2>&1
 service iptables save >/dev/null 2>&1
 green "Sing-box卸载完成！"
@@ -4806,6 +4892,9 @@ blue "推荐甬哥新品：ArgoSBX一键无交互小钢炮脚本"
 blue "ArgoSBX项目地址：https://github.com/yonggekkk/argosbx"
 echo
 }
+
+# 有IPv4的VPS上 resolv.conf 只剩 NAT64 DNS（旧版本误判纯IPv6的后果，所有域名无法解析）→ 自动恢复
+sbdns_isnat64 && sbnet4 && sbdns_restore
 
 # 非交互入口：sbagent 重置参数后调用，重新生成分享链接/订阅并推送 Gitlab、TG
 if [[ "$1" == "--share" ]]; then

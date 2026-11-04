@@ -180,3 +180,30 @@ jobs:
         run: bash tests/input.sh
       - name: sbagent unit tests
         run: python3 tests/test_sbagent.py
+      - name: system DNS (NAT64) logic
+        run: bash tests/dns.sh
+      - name: firewall/uninstall keep other programs' rules (real iptables, runner has Docker)
+        run: |
+          src=$(mktemp)
+          { sed -n '/^yellow(){/p;/^green(){/p' sb.sh; sed -n '/^close(){/,/^}/p;/^sbunhop(){/,/^}/p' sb.sh; } > "$src"
+          sudo iptables -t nat -N SBTEST 2>/dev/null || true
+          sudo iptables -t nat -A PREROUTING -p tcp --dport 18443 -j SBTEST
+          sudo iptables -t nat -A PREROUTING -p udp --dport 30000:31000 -j DNAT --to-destination :20003
+          sudo ip6tables -t nat -A PREROUTING -p udp --dport 30000:31000 -j DNAT --to-destination :20003
+          sudo iptables -A INPUT -p tcp --dport 9 -j DROP
+          sudo ip6tables -A INPUT -p tcp --dport 9 -j DROP
+          before=$(sudo iptables -S | grep -c -- '-N DOCKER' || true)
+          echo "docker chains before: $before"
+          sudo bash -c "source $src; close; sbunhop 20003"
+          after=$(sudo iptables -S | grep -c -- '-N DOCKER' || true)
+          echo "docker chains after: $after"
+          [[ "$before" == "$after" ]] || { echo "::error title=close::Docker chains removed ($before -> $after)"; exit 1; }
+          sudo iptables -t nat -S | grep -q -- '-j SBTEST' || { echo "::error title=uninstall::unrelated nat rule removed"; exit 1; }
+          ! sudo iptables -t nat -S | grep -q -- ':20003' || { echo "::error title=uninstall::hop rule (v4) not removed"; exit 1; }
+          ! sudo ip6tables -t nat -S | grep -q -- ':20003' || { echo "::error title=uninstall::hop rule (v6) not removed"; exit 1; }
+          ! sudo iptables -S INPUT | grep -q 'dport 9 ' || { echo "::error title=close::IPv4 INPUT not opened"; exit 1; }
+          ! sudo ip6tables -S INPUT | grep -q 'dport 9 ' || { echo "::error title=close::IPv6 INPUT not opened"; exit 1; }
+          docker run --rm -p 18080:80 -d --name sbweb nginx:alpine > /dev/null && sleep 3
+          curl -sf -o /dev/null http://127.0.0.1:18080 || { echo "::error title=close::Docker port publishing broken"; exit 1; }
+          docker rm -f sbweb > /dev/null
+          echo "ok"

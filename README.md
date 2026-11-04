@@ -80,6 +80,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 | 自动化验证 | 无 | GitHub Actions：在真实 sing-box（最新正式版/测试版/1.10.7）上校验配置模板、systemd 启动、流量统计、远程升级与回滚；单元测试 |
 
 **修复的原版问题**（详见 [CHANGELOG.md](CHANGELOG.md)）：
+* IPv4 VPS 可能被误判为纯IPv6，系统DNS被改为仅IPv6的 NAT64 DNS，导致所有域名无法解析（现在按路由与直连IP判断，修改前备份并验证，已受影响的自动恢复）
+* 「关闭防火墙」清空所有 iptables 链（Docker 网络中断）且不处理 IPv6；卸载清空整个 nat PREROUTING 链
 * 自定义端口时按退格键会把不可见字符写进端口，导致 Sing-box 无法启动（脚本强制 `stty erase ^H`）
 * 脚本自更新与 WARP-plus 程序下载使用 `--insecure`（不校验 HTTPS 证书），存在被中间人替换的风险
 * 删除 Hy2/Tuic 端口跳跃后提示不显示；Acme 证书申请失败判断错误；停止一种 Argo 隧道会删除另一种隧道正在使用的 cloudflared

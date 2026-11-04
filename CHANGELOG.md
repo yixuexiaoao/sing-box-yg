@@ -1,5 +1,24 @@
 # 变更日志
 
+## v26.11.11（2026-11-04）
+
+### 修复（原版遗留）
+- **系统DNS被改为仅IPv6后，所有域名无法解析**：安装时只要 `curl -4 icanhazip.com` 没有返回就判定为「纯IPv6 VPS」，直接用两个仅IPv6的 NAT64 DNS 覆盖 `/etc/resolv.conf`，不备份、不验证。这个请求本身依赖DNS，网络抖动、DNS暂时故障、icanhazip 不可达都会让 IPv4 VPS 被误判；IPv4 VPS 访问不了IPv6 DNS，于是所有域名都无法解析，再次运行脚本又因解析失败继续误判，无法自行恢复
+  - 判断网络栈不再依赖DNS：IPv4 需有默认路由且能直接访问IP地址（1.1.1.1 / 9.9.9.9）；只有「没有可用IPv4、IPv6可用」才算纯IPv6；两者都检测不到时不修改DNS
+  - 纯IPv6时先测试现有DNS能否访问仅IPv4的 github.com，能（服务商已提供DNS64）则不修改
+  - 修改前备份（`/etc/resolv.conf.sbyg.bak`，符号链接也能还原）；保留原有的IPv6 DNS作为后备；修改后实测，不通则恢复原配置
+  - VPS 有IPv4却发现 resolv.conf 只有本脚本（或旧版本）写入的 NAT64 DNS 时，运行 `sb` 即自动恢复（旧版本未备份的改为公共DNS）；卸载时恢复
+  - 若已无法解析域名、下载不了脚本，先执行：`echo -e "nameserver 1.1.1.1
+nameserver 8.8.8.8" > /etc/resolv.conf`
+- **「开放端口、关闭防火墙」（安装第一步，默认执行）破坏其它服务网络**：原先 `iptables -F`、`iptables -X`、`iptables -t mangle -F` 清空所有链并删除自定义链，Docker 端口映射与容器网络、WARP/WireGuard 策略路由等都会中断；而 IPv6 防火墙完全没有处理，纯IPv6 VPS 端口仍然不通
+  - 现在只放开 INPUT/OUTPUT（IPv4 与 IPv6），有 Docker 时不改动 FORWARD；不再删除任何链
+  - 不再因为装了 Apache 就停止并禁用它（会关掉VPS上的网站），只在其占用80端口时提示
+- **卸载清空整个 nat PREROUTING 链**：原先 `iptables -t nat -F PREROUTING` 会删掉 Docker 等其它程序的端口转发；现在只删除 DNAT 到 Hy2/Tuic 端口的端口跳跃规则（IPv4 与 IPv6，原先 IPv6 规则不会删除）
+
+### 测试
+- 新增 `tests/dns.sh`：先用原版逻辑复现误判覆盖DNS的问题，再验证新逻辑在 DNS抖动/无网络/纯IPv6已有DNS64/需要NAT64/NAT64不可用/之后有了IPv4/旧版损坏状态/符号链接 等情况下的行为，以及卸载只删除端口跳跃规则
+- CI：在有 Docker 的真实环境中执行「关闭防火墙」与卸载清理，确认 Docker 链与其它 nat 规则保留、IPv4/IPv6 入站已放开、Docker 端口映射仍可访问
+
 ## v26.11.10（2026-11-04）
 
 ### 修复
