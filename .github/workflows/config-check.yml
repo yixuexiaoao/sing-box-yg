@@ -141,9 +141,8 @@ jobs:
           got=$(sudo cat /etc/s-box/v)
           if [[ "$st" != active || "$got" != "$want" ]]; then echo "::error title=upgrade::state=$st version=$got want=$want"; sudo journalctl -u sbagent -n 20 --no-pager; exit 1; fi
           # 2) 坏版本：能通过语法校验但启动即退出，应自动回滚
-          printf '%s
-' "$(sed 's/^def serve():/def serve():
-    raise SystemExit("boom")/' sbagent.py)" > /tmp/up/sbagent.py
+          python3 -c 'import sys; s = open("sbagent.py").read(); open("/tmp/up/sbagent.py", "w").write(s.replace("def serve():", "def serve():\n    raise SystemExit(\"boom\")", 1))'
+          grep -q 'SystemExit("boom")' /tmp/up/sbagent.py
           sudo SB_UPDATE_BASE=http://127.0.0.1:18765 python3 /etc/s-box/sbagent.py upgrade
           sleep 30
           st=$(systemctl is-active sbagent || true); echo "after bad upgrade: $st"
