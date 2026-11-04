@@ -11,10 +11,23 @@ green(){ echo -e "\033[32m\033[01m$1\033[0m";}
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
-readp(){ read -p "$(yellow "$1")" $2;}
+readp(){ read -p "$(yellow "$1")" "$2"; local __sbrc=$?; [[ -n $2 ]] && sbclean "$2"; return $__sbrc;}
+# 终端退格键发送 ^? 或 ^H 时若未被终端驱动处理，会以控制字符形式进入变量（如端口变成 "2345\x7f6"，导致配置无法解析）
+# 局部变量使用不常见的名字，避免与调用方传入的变量同名时写进局部变量
+sbclean(){
+local __sbv="${!1}" __sbo="" __sbc __sbi
+for ((__sbi=0; __sbi<${#__sbv}; __sbi++)); do
+__sbc="${__sbv:__sbi:1}"
+case "$__sbc" in
+$'\x7f'|$'\b') __sbo="${__sbo%?}";;
+[[:cntrl:]]) ;;
+*) __sbo+="$__sbc";;
+esac
+done
+printf -v "$1" '%s' "$__sbo"
+}
 sbsleep(){ [ -t 1 ] && sleep "$1"; return 0;}
 [[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
-stty erase $'\b' 2>/dev/null || stty erase '^H' 2>/dev/null
 #[[ -e /etc/hosts ]] && grep -qE '^ *172.65.251.78 gitlab.com' /etc/hosts || echo -e '\n172.65.251.78 gitlab.com' >> /etc/hosts
 if [[ -f /etc/redhat-release ]]; then
 release="Centos"
@@ -324,19 +337,28 @@ fi
 fi
 }
 
+sbportok(){
+[[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+sbportbusy(){
+ss -tunlp 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -qx "$1"
+}
 chooseport(){
+while :; do
 if [[ -z $port ]]; then
 port=$(shuf -i 10000-65535 -n 1)
-until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") && -z $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] 
-do
-[[ -n $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") || -n $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] && yellow "\n端口被占用，请重新输入端口" && readp "自定义端口:" port
-done
-else
-until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") && -z $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]
-do
-[[ -n $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") || -n $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] && yellow "\n端口被占用，请重新输入端口" && readp "自定义端口:" port
-done
+sbportbusy "$port" && port= && continue
+break
 fi
+if ! sbportok "$port"; then
+yellow "\n端口格式错误：$port ，请输入1-65535之间的数字"; readp "自定义端口:" port || exit 1; continue
+fi
+if sbportbusy "$port"; then
+yellow "\n端口被占用，请重新输入端口"; readp "自定义端口:" port || exit 1; continue
+fi
+break
+done
+port=$((10#$port))
 blue "确认的端口：$port" && sleep 2
 }
 
@@ -2919,8 +2941,10 @@ if [ "$menu" = "1" ]; then
 readp "输入uuid，必须是uuid格式，不懂就回车(重置并随机生成uuid)：" menu
 if [ -z "$menu" ]; then
 uuid=$(/etc/s-box/sing-box generate uuid)
-else
+elif [[ $menu =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; then
 uuid=$menu
+else
+red "uuid格式错误：$menu" && sleep 2 && changeuuid && return
 fi
 echo $sbfiles | xargs -n1 sed -i "s/$olduuid/$uuid/g"
 restartsb && sbshare > /dev/null 2>&1
@@ -3142,8 +3166,10 @@ echo
 readp "输入未被占用且可用的订阅链接端口（回车表示随机端口）：" menu
 if [ -z "$menu" ]; then
 subport=$(shuf -i 10000-65535 -n 1)
+elif sbportok "$menu"; then
+subport=$((10#$menu))
 else
-subport="$menu"
+red "端口格式错误，请输入1-65535之间的数字" && subportipsub && return
 fi
 echo $subport > /etc/s-box/subport.log
 green "订阅链接端口：$(cat /etc/s-box/subport.log 2>/dev/null)"

@@ -7,6 +7,7 @@ on:
     paths:
       - sb.sh
       - sbagent.py
+      - tests/**
       - .github/workflows/config-check.yml
   workflow_dispatch:
   schedule:
@@ -111,3 +112,5 @@ jobs:
         run: python3 -m py_compile sbagent.py && python3 sbagent.py --help > /dev/null
       - name: shell syntax
         run: for f in sb.sh kp.sh serv00.sh serv00keep.sh; do bash -n "$f"; done
+      - name: input sanitizing & port validation
+        run: bash tests/input.sh
