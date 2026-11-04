@@ -26,7 +26,7 @@ import uuid as uuidlib
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
 SB_BIN = os.environ.get("SB_BIN", os.path.join(SB_DIR, "sing-box"))
 SB_CMD = os.environ.get("SB_CMD", "/usr/bin/sb")
@@ -176,107 +176,200 @@ def parse_time(tz, ts):
         return 0
 
 
-def read_log_lines(max_bytes=40 * 1024 * 1024):
+LOG_BUDGET = 40 * 1024 * 1024
+MAX_RECS = 200000
+INDEX_IDLE = 600
+
+
+def _file_id(path):
+    try:
+        st = os.stat(path)
+        return st.st_dev, st.st_ino, st.st_size, st.st_mtime
+    except OSError:
+        return None
+
+
+def read_log_data(max_bytes=LOG_BUDGET):
+    """读取 .1 与当前日志的尾部，返回 (按时间顺序的文本块列表, 当前文件已读到的完整行位置)。"""
     chunks = []
+    pos = 0
     budget = max_bytes
     for path in (LOG_FILE, LOG_FILE + ".1"):
         if budget <= 0 or not os.path.exists(path):
             continue
-        size = os.path.getsize(path)
         with open(path, "rb") as f:
-            if size > budget:
-                f.seek(size - budget)
-                data = f.read()
-                data = data[data.find(b"\n") + 1:]
-            else:
-                data = f.read()
+            size = os.fstat(f.fileno()).st_size
+            start = max(0, size - budget)
+            f.seek(start)
+            data = f.read(size - start)
+        if start:
+            data = data[data.find(b"\n") + 1:]
+        if path == LOG_FILE:
+            cut = data.rfind(b"\n") + 1  # 只取完整行，未写完的行留给下次增量读取
+            pos = size - (len(data) - cut)
+            data = data[:cut]
         budget -= len(data)
         chunks.insert(0, data)
-    for data in chunks:
+    return chunks, pos
+
+
+def read_log_lines(max_bytes=LOG_BUDGET):
+    for data in read_log_data(max_bytes)[0]:
         for line in data.decode("utf-8", "replace").splitlines():
             yield line
 
 
-def parse_log(lines):
-    """把 sing-box 日志按连接ID关联为访问记录列表（时间正序）。"""
-    recs = []
-    conns = collections.OrderedDict()  # 连接ID -> {src, sport, proto, tag, cur}
+class LogParser(object):
+    """把 sing-box 日志按连接ID关联为访问记录（时间正序），支持增量喂入。"""
 
-    def state(cid):
-        st = conns.get(cid)
+    def __init__(self):
+        self.recs = []
+        self.conns = collections.OrderedDict()  # 连接ID -> {src, sport, proto, tag, cur}
+        self._tkey = None
+        self._tval = 0
+
+    def _state(self, cid):
+        st = self.conns.get(cid)
         if st is None:
-            st = conns[cid] = {}
-            if len(conns) > 100000:
-                conns.popitem(last=False)
+            st = self.conns[cid] = {}
+            if len(self.conns) > 100000:
+                self.conns.popitem(last=False)
         return st
 
-    for raw in lines:
-        m = LINE_RE.match(ANSI_RE.sub("", raw.rstrip("\r\n")))
-        if not m:
-            continue
-        tz, tstr, level, cid, rest = m.groups()
-        tm = TAG_RE.match(rest)
-        if tm:
-            _, ptype, ptag, msg = tm.groups()
-        else:
-            ptype, ptag, msg = None, None, rest
-        if level in ("INFO", "DEBUG", "TRACE"):
-            if not cid:
+    def _time(self, tz, tstr):
+        if (tz, tstr) != self._tkey:  # 同一秒内大量日志，缓存避免重复 strptime
+            self._tkey = (tz, tstr)
+            self._tval = parse_time(tz, tstr)
+        return self._tval
+
+    def feed(self, lines):
+        recs, conns, state = self.recs, self.conns, self._state
+        for raw in lines:
+            # 先用子串快速排除 DNS、启动等无关行，避免逐行正则
+            if "connection" not in raw and "sniffed" not in raw and "ERROR" not in raw and "WARN" not in raw:
                 continue
-            fm = FROM_RE.match(msg)
-            if fm:
-                host, port = split_hostport(fm.group(2))
-                conns.pop(cid, None)
-                st = state(cid)
-                st.update(src=norm_ip(host), sport=port, proto=ptype, tag=ptag)
+            if "\x1b" in raw:
+                raw = ANSI_RE.sub("", raw)
+            m = LINE_RE.match(raw.rstrip("\r\n"))
+            if not m:
                 continue
-            tom = TO_RE.match(msg)
-            if tom:
-                st = state(cid)
-                rec = {"t": parse_time(tz, tstr), "id": cid, "proto": ptype or st.get("proto"),
-                       "tag": ptag or st.get("tag"), "src": st.get("src", ""), "sport": st.get("sport", ""),
-                       "dst": tom.group(3), "net": "udp" if tom.group(2) else "tcp"}
-                if tom.group(1) and not tom.group(1).isdigit():
-                    rec["user"] = tom.group(1)
-                recs.append(rec)
+            tz, tstr, level, cid, rest = m.groups()
+            tm = TAG_RE.match(rest)
+            if tm:
+                _, ptype, ptag, msg = tm.groups()
+            else:
+                ptype, ptag, msg = None, None, rest
+            if level in ("INFO", "DEBUG", "TRACE"):
+                if not cid:
+                    continue
+                if msg.startswith("inbound "):
+                    fm = FROM_RE.match(msg)
+                    if fm:
+                        host, port = split_hostport(fm.group(2))
+                        conns.pop(cid, None)
+                        state(cid).update(src=norm_ip(host), sport=port, proto=ptype, tag=ptag)
+                        continue
+                tom = TO_RE.match(msg)
+                if tom:
+                    st = state(cid)
+                    rec = {"t": self._time(tz, tstr), "id": cid, "proto": ptype or st.get("proto"),
+                           "tag": ptag or st.get("tag"), "src": st.get("src", ""), "sport": st.get("sport", ""),
+                           "dst": tom.group(3), "net": "udp" if tom.group(2) else "tcp"}
+                    if tom.group(1) and not tom.group(1).isdigit():
+                        rec["user"] = tom.group(1)
+                    recs.append(rec)
+                    st["cur"] = rec
+                    continue
+                om = OUT_RE.match(msg)
+                if om:
+                    cur = conns.get(cid, {}).get("cur")
+                    if cur is not None and "out" not in cur:
+                        cur["out"] = "%s[%s]" % (ptype, ptag) if ptype else ""
+                        if om.group(2) != cur["dst"]:
+                            cur["odst"] = om.group(2)
+                    continue
+                sm = SNIFF_RE.match(msg)
+                if sm:
+                    cur = conns.get(cid, {}).get("cur")
+                    if cur is not None:
+                        cur["sniff"] = sm.group(2)
+                        if sm.group(3):
+                            cur["domain"] = sm.group(3)
+                continue
+            # WARN / ERROR：认证失败、主动探测、连接异常
+            st = conns.get(cid) if cid else None
+            cur = st.get("cur") if st else None
+            if cur is not None:
+                cur.setdefault("err", msg[:300])
+                continue
+            src, sport = (st.get("src"), st.get("sport")) if st else ("", "")
+            if not src:
+                em = ERRFROM_RE.search(msg)
+                if not em:
+                    continue
+                host, sport = split_hostport(em.group(1))
+                src = norm_ip(host)
+            rec = {"t": self._time(tz, tstr), "id": cid or "", "proto": ptype or (st or {}).get("proto"),
+                   "tag": ptag or (st or {}).get("tag"), "src": src, "sport": sport, "dst": "",
+                   "net": "tcp", "err": msg[:300]}
+            recs.append(rec)
+            if st is not None:
                 st["cur"] = rec
-                continue
-            om = OUT_RE.match(msg)
-            if om:
-                cur = conns.get(cid, {}).get("cur")
-                if cur is not None and "out" not in cur:
-                    cur["out"] = "%s[%s]" % (ptype, ptag) if ptype else ""
-                    if om.group(2) != cur["dst"]:
-                        cur["odst"] = om.group(2)
-                continue
-            sm = SNIFF_RE.match(msg)
-            if sm:
-                cur = conns.get(cid, {}).get("cur")
-                if cur is not None:
-                    cur["sniff"] = sm.group(2)
-                    if sm.group(3):
-                        cur["domain"] = sm.group(3)
-            continue
-        # WARN / ERROR：认证失败、主动探测、连接异常
-        st = conns.get(cid) if cid else None
-        cur = st.get("cur") if st else None
-        if cur is not None:
-            cur.setdefault("err", msg[:300])
-            continue
-        src, sport = (st.get("src"), st.get("sport")) if st else ("", "")
-        if not src:
-            em = ERRFROM_RE.search(msg)
-            if not em:
-                continue
-            host, sport = split_hostport(em.group(1))
-            src = norm_ip(host)
-        rec = {"t": parse_time(tz, tstr), "id": cid or "", "proto": ptype or (st or {}).get("proto"),
-               "tag": ptag or (st or {}).get("tag"), "src": src, "sport": sport, "dst": "",
-               "net": "tcp", "err": msg[:300]}
-        recs.append(rec)
-        if st is not None:
-            st["cur"] = rec
-    return recs
+        if len(recs) > MAX_RECS:
+            del recs[:len(recs) - MAX_RECS]
+        return self
+
+
+def parse_log(lines):
+    return LogParser().feed(lines).recs
+
+
+class LogIndex(object):
+    """API 常驻模式下的日志缓存：只增量解析新追加的内容；轮转/截断时重建；空闲后释放内存。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.parser = None
+        self.ident = None
+        self.rot = None
+        self.pos = 0
+        self.used = 0
+
+    def records(self):
+        with self.lock:
+            self.used = time.time()
+            cur = _file_id(LOG_FILE)
+            rot = _file_id(LOG_FILE + ".1")
+            ident = cur[:2] if cur else None
+            if self.parser is None or ident != self.ident or rot != self.rot or (cur and cur[2] < self.pos):
+                chunks, self.pos = read_log_data()
+                self.parser = LogParser()
+                for data in chunks:
+                    self.parser.feed(data.decode("utf-8", "replace").splitlines())
+                self.ident, self.rot = ident, rot
+            elif cur and cur[2] > self.pos:
+                with open(LOG_FILE, "rb") as f:
+                    f.seek(self.pos)
+                    data = f.read(cur[2] - self.pos)
+                cut = data.rfind(b"\n") + 1
+                if cut:
+                    self.parser.feed(data[:cut].decode("utf-8", "replace").splitlines())
+                    self.pos += cut
+            return list(self.parser.recs)
+
+    def drop_if_idle(self):
+        with self.lock:
+            if self.parser is not None and time.time() - self.used > INDEX_IDLE:
+                self.parser = None
+
+
+LOG_INDEX = None  # serve 模式下启用
+
+
+def all_records():
+    if LOG_INDEX is not None:
+        return LOG_INDEX.records()
+    return parse_log(read_log_lines())
 
 
 def rec_target(r):
@@ -317,7 +410,7 @@ def log_info():
 
 
 def query_logs(p):
-    recs = parse_log(read_log_lines())
+    recs = all_records()
     sel = filter_recs(recs, p.get("hours"), p.get("ip"), p.get("q"), p.get("proto"),
                       bool(p.get("err")), bool(p.get("hidelocal")))
     limit = max(1, min(int(p.get("limit") or 200), 5000))
@@ -333,7 +426,7 @@ def query_logs(p):
 def query_stats(p):
     hours = p.get("hours", 24)
     top = max(1, min(int(p.get("top") or 100), 1000))
-    recs = filter_recs(parse_log(read_log_lines()), hours)
+    recs = filter_recs(all_records(), hours)
     by_ip = {}
     by_dest = {}
     for r in recs:
@@ -426,17 +519,20 @@ def logging_enabled():
 def set_logging(on):
     # 只改 "timestamp": true 这一行，保持 sb.sh 依赖的行号不变
     out_kv = ', "output": %s' % json.dumps(LOG_FILE)
+    changed = False
     for path in conf_paths():
         text = read(path)
         new = re.sub(r'("timestamp":\s*true)(, "output": "(?:[^"\\]|\\.)*")?',
                      lambda m: m.group(1) + (out_kv if on else ""), text, count=1)
         if new != text:
             write(path, new)
+            changed = True
     if on:
         cron_set(ROTATE_MARK, ROTATE_CRON)
     else:
         cron_del(ROTATE_MARK)
-    svc_restart("sing-box")
+    if changed:
+        svc_restart("sing-box")
     return {"enabled": logging_enabled()}
 
 
@@ -639,6 +735,9 @@ def do_reset(items, regen=True):
     port_moves = []
     if "ports" in items:
         used = set(inbound_ports())
+        for extra in (read(os.path.join(SB_DIR, "subport.log")).strip(), str((load_json(API_CONF, None) or {}).get("port", ""))):
+            if extra.isdigit():
+                used.add(int(extra))
         moved = {}
         for ib in ibs:
             if ib.get("type") in ("vless", "hysteria2", "tuic", "anytls") and "listen_port" in ib:
@@ -715,6 +814,8 @@ def schedule(p):
     marker = "sbagent.py reset --cron"
     if mode is None:
         return {"cron": cron_get(marker)}
+    if mode not in ("off", "daily", "weekly"):
+        raise ValueError("mode 只能是 off/daily/weekly")
     if mode == "off":
         cron_del(marker)
     else:
@@ -731,8 +832,14 @@ def leak_conf(p=None):
         for k in ("enabled", "threshold", "hours", "action", "items"):
             if k in p:
                 conf[k] = p[k]
+        conf["enabled"] = bool(conf["enabled"])
         conf["threshold"] = int(conf["threshold"])
         conf["hours"] = float(conf["hours"])
+        if conf["threshold"] < 1 or not 0 < conf["hours"] <= 720:
+            raise ValueError("阈值需≥1，统计时长需在 0~720 小时之间")
+        if conf["action"] not in ("notify", "reset"):
+            raise ValueError("action 只能是 notify/reset")
+        conf["items"] = ",".join(sorted(parse_items(conf.get("items") or "all")))
         write(LEAK_CONF, json.dumps(conf, ensure_ascii=False))
         marker = "sbagent.py leakcheck"
         if conf["enabled"]:
@@ -744,7 +851,7 @@ def leak_conf(p=None):
 
 def leak_check(auto=False):
     conf = leak_conf()
-    recs = filter_recs(parse_log(read_log_lines()), conf["hours"], hide_local=True)
+    recs = filter_recs(all_records(), conf["hours"], hide_local=True)
     ips = collections.Counter(r["src"] for r in recs if r["src"] and not r.get("err") and r.get("dst"))
     res = {"hours": conf["hours"], "threshold": conf["threshold"], "unique_ips": len(ips),
            "ips": ips.most_common(50), "exceeded": len(ips) > conf["threshold"], "action": None}
@@ -778,11 +885,23 @@ def tg_send(text):
 
 
 # ---------------------------------------------------------------- 状态
+_VER_CACHE = {}
+
+
+def sb_version():
+    fid = _file_id(SB_BIN)
+    if fid is None:
+        return ""
+    if _VER_CACHE.get("id") != fid:
+        _VER_CACHE.update(id=fid, ver=runs([SB_BIN, "version"])[1])
+    return _VER_CACHE["ver"]
+
+
 def status(_p=None):
     cfg = load_sbjson()
     inbounds = [{"type": i.get("type"), "name": PROTO_NAMES.get(i.get("type"), i.get("type")),
                  "tag": i.get("tag"), "port": i.get("listen_port")} for i in cfg.get("inbounds", [])]
-    _, ver = runs([SB_BIN, "version"]) if os.path.exists(SB_BIN) else (1, "")
+    ver = sb_version()
     osname = ""
     m = re.search(r'PRETTY_NAME="?([^"\n]+)', read("/etc/os-release"))
     if m:
@@ -925,6 +1044,7 @@ class Api(object):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30
     protocol_version = "HTTP/1.0"
     server_version = "nginx"
     sys_version = ""
@@ -991,6 +1111,14 @@ def serve():
     conf = load_json(API_CONF)
     if not conf or not conf.get("token"):
         sys.exit("未初始化API，请先执行：sbagent.py apiinit")
+    global LOG_INDEX
+    LOG_INDEX = LogIndex()
+
+    def janitor():
+        while True:
+            time.sleep(60)
+            LOG_INDEX.drop_if_idle()
+    threading.Thread(target=janitor, daemon=True).start()
     srv = make_server(conf)
     sys.stderr.write("sbagent %s API listening on %s:%s%s\n" % (VERSION, conf.get("listen") or "::",
                                                               conf["port"], srv.api.path))

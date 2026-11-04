@@ -12,6 +12,7 @@ yellow(){ echo -e "\033[33m\033[01m$1\033[0m";}
 blue(){ echo -e "\033[36m\033[01m$1\033[0m";}
 white(){ echo -e "\033[37m\033[01m$1\033[0m";}
 readp(){ read -p "$(yellow "$1")" $2;}
+sbsleep(){ [ -t 1 ] && sleep "$1"; return 0;}
 [[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit
 stty erase $'\b' 2>/dev/null || stty erase '^H' 2>/dev/null
 #[[ -e /etc/hosts ]] && grep -qE '^ *172.65.251.78 gitlab.com' /etc/hosts || echo -e '\n172.65.251.78 gitlab.com' >> /etc/hosts
@@ -133,11 +134,19 @@ fi
 fi
 fi
 v4v6(){
-v4=$(curl -s4m5 icanhazip.com -k)
-v6=$(curl -s6m5 icanhazip.com -k)
-#v4dq=$(curl -s4m5 -k https://myip.ipip.net | awk -F'来自于：' '{print $2}' 2>/dev/null)
-v4dq=$(curl -s4m5 -k https://ip.fm | sed -n 's/.*Location: //p' 2>/dev/null)
-v6dq=$(curl -s6m5 -k https://ip.fm | sed -n 's/.*Location: //p' 2>/dev/null)
+local tmpd p1 p2 p3 p4
+tmpd=$(mktemp -d 2>/dev/null) || { tmpd=/tmp/sbv4v6.$$; mkdir -p "$tmpd"; }
+curl -s4m5 icanhazip.com -k > "$tmpd/v4" 2>/dev/null & p1=$!
+curl -s6m5 icanhazip.com -k > "$tmpd/v6" 2>/dev/null & p2=$!
+curl -s4m5 -k https://ip.fm > "$tmpd/d4" 2>/dev/null & p3=$!
+curl -s6m5 -k https://ip.fm > "$tmpd/d6" 2>/dev/null & p4=$!
+wait $p1 $p2 $p3 $p4 2>/dev/null
+v4=$(cat "$tmpd/v4" 2>/dev/null)
+v6=$(cat "$tmpd/v6" 2>/dev/null)
+v4dq=$(sed -n 's/.*Location: //p' "$tmpd/d4" 2>/dev/null)
+v6dq=$(sed -n 's/.*Location: //p' "$tmpd/d6" 2>/dev/null)
+rm -rf "$tmpd"
+v4v6done=1
 }
 warpcheck(){
 wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -1092,7 +1101,7 @@ echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 vl_link="vless://$uuid@$server_ip:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#vl-reality-$hostname"
 echo "$vl_link" > /etc/s-box/vl_reality.txt
-red "🚀【 vless-reality-vision 】节点信息如下：" && sleep 2
+red "🚀【 vless-reality-vision 】节点信息如下：" && sbsleep 2
 echo
 echo "分享链接【v2ran(切换singbox内核)、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$vl_link${plain}"
@@ -1108,7 +1117,7 @@ if [[ "$tls" = "false" ]]; then
 if ps -ef 2>/dev/null | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')" >/dev/null 2>&1; then
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws(tls)+Argo 】临时节点信息如下(可选择3-8-3，自定义CDN优选地址)：" && sleep 2
+red "🚀【 vmess-ws(tls)+Argo 】临时节点信息如下(可选择3-8-3，自定义CDN优选地址)：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_argo'","aid":"0","host":"'$argo'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"443","ps":"'vm-argo-$hostname'","tls":"tls","sni":"'$argo'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1121,7 +1130,7 @@ if ps -ef 2>/dev/null | grep -q '[c]loudflared.*run'; then
 argogd=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws(tls)+Argo 】固定节点信息如下 (可选择3-8-3，自定义CDN优选地址)：" && sleep 2
+red "🚀【 vmess-ws(tls)+Argo 】固定节点信息如下 (可选择3-8-3，自定义CDN优选地址)：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_argo'","aid":"0","host":"'$argogd'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"443","ps":"'vm-argo-$hostname'","tls":"tls","sni":"'$argogd'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1132,7 +1141,7 @@ qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws_argogd.txt)"
 fi
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && sleep 2
+red "🚀【 vmess-ws 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_are_local'","aid":"0","host":"'$vm_name'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"'$vm_port'","ps":"'vm-ws-$hostname'","tls":"","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1143,7 +1152,7 @@ qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws.txt)"
 else
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws-tls 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && sleep 2
+red "🚀【 vmess-ws-tls 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_are_local'","aid":"0","host":"'$vm_name'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"'$vm_port'","ps":"'vm-ws-tls-$hostname'","tls":"tls","sni":"'$vm_name'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1162,7 +1171,7 @@ white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=0&allowInsecure=0$hyps&sni=$hy2_name${SHA256:+&pinSHA256=$SHA256}#hy2-$hostname"
 #hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$ins_hy2&allowInsecure=$ins_hy2$hyps&sni=$hy2_name#hy2-$hostname"
 echo "$hy2_link" > /etc/s-box/hy2.txt
-red "🚀【 Hysteria-2 】节点信息如下：" && sleep 2
+red "🚀【 Hysteria-2 】节点信息如下：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$hy2_link${plain}"
@@ -1178,7 +1187,7 @@ echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 tuic5_link="tuic://$uuid:$uuid@$sb_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&insecure=$ins&allowInsecure=$ins&allow_insecure=$ins#tu5-$hostname"
 echo "$tuic5_link" > /etc/s-box/tuic5.txt
-red "🚀【 Tuic-v5 】节点信息如下：" && sleep 2
+red "🚀【 Tuic-v5 】节点信息如下：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$tuic5_link${plain}"
@@ -1194,7 +1203,7 @@ echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 an_link="anytls://$uuid@$sb_an_ip:$an_port?sni=$an_name&allowInsecure=$ins_an&insecure=$ins_an#anytls-$hostname"
 echo "$an_link" > /etc/s-box/an.txt
-red "🚀【 Anytls】节点信息如下：" && sleep 2
+red "🚀【 Anytls】节点信息如下：" && sbsleep 2
 echo
 echo "分享链接【v2rayn、小火箭shadowrocket】"
 echo -e "${yellow}$an_link${plain}"
@@ -3439,7 +3448,7 @@ else
 warp_s4_ip='Socks5-IPV4可用'
 warp_s6_ip='Socks5-IPV6自测'
 fi
-v4v6
+[[ -n $v4v6done ]] || v4v6
 if [[ -z $v4 ]]; then
 vps_ipv4='无本地IPV4，黑名单模式'      
 vps_ipv6="当前IP：$v6"
@@ -3977,7 +3986,7 @@ v2sub=$(cat /etc/s-box/jhdy.txt 2>/dev/null)
 echo "$v2sub" > /etc/s-box/jhsub.txt
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 聚合节点 】节点信息如下：" && sleep 2
+red "🚀【 聚合节点 】节点信息如下：" && sbsleep 2
 echo
 echo "分享链接"
 echo -e "${yellow}$v2sub${plain}"
@@ -4571,14 +4580,15 @@ white "-------------------------------------------------------------------------
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
-latestV=$(curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1)
+verinfo=$(curl -sL --max-time 5 ${sbrepo}/version)
+latestV=$(echo "$verinfo" | awk -F "更新内容" '{print $1}' | head -n 1)
 if [ -f /etc/s-box/v ]; then
 if [ "$insV" = "$latestV" ]; then
 echo -e "当前 Sing-box-yg 脚本最新版：${bblue}${insV}${plain} (已安装)"
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${insV}${plain}"
 echo -e "检测到最新 Sing-box-yg 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
-echo -e "${yellow}$(curl -sL ${sbrepo}/version)${plain}"
+echo -e "${yellow}${verinfo}${plain}"
 fi
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${latestV}${plain}"
