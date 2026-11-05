@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -37,7 +38,8 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
+START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
 SB_DIR = os.environ.get("SB_DIR", "/etc/s-box")
@@ -1924,7 +1926,7 @@ class Api(object):
         now = time.time()
         ts = float(req.get("ts", 0))
         nonce = str(req.get("nonce", ""))
-        if abs(now - ts) > 300 or len(nonce) < 16:
+        if not math.isfinite(ts) or abs(now - ts) > 300 or ts < START_TS - 5 or len(nonce) < 16:
             raise ValueError("expired")
         with self.lock:
             for k in [k for k, v in self.nonces.items() if now - v > 600]:
@@ -1971,7 +1973,8 @@ class Api(object):
 
 
 class Handler(BaseHTTPRequestHandler):
-    timeout = 30
+    timeout = 10
+    BODY_DEADLINE = 15  # 读取整个请求体的总时限（秒）：防止慢速滴灌占满并发连接
     protocol_version = "HTTP/1.0"
     server_version = "nginx"
     sys_version = ""
@@ -1992,6 +1995,20 @@ class Handler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def read_body(self, n):
+        end = time.time() + self.BODY_DEADLINE
+        buf = b""
+        while len(buf) < n:
+            left = end - time.time()
+            if left <= 0:
+                raise TimeoutError("read body timeout")
+            self.connection.settimeout(min(left, 10))
+            chunk = self.rfile.read1(min(65536, n - len(buf)))
+            if not chunk:
+                raise ConnectionError("short body")
+            buf += chunk
+        return buf
+
     def do_POST(self):
         api = self.server.api
         ip = norm_ip(self.client_address[0])
@@ -2004,7 +2021,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != api.path or n <= 0 or n > 2 * 1024 * 1024:
             api.record_fail(ip, "path")
             return self.do_GET()
-        body = self.rfile.read(n)
+        try:
+            body = self.read_body(n)
+        except Exception as e:
+            api.record_fail(ip, str(e))
+            return
         try:
             out = api.handle(body, ip)
         except Exception as e:

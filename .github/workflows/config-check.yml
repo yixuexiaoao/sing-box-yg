@@ -13,6 +13,9 @@ on:
   schedule:
     - cron: '0 3 * * 1'   # 每周检查一次最新内核
 
+permissions:
+  contents: read
+
 jobs:
   singbox:
     runs-on: ubuntu-latest

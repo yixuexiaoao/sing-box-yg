@@ -404,6 +404,30 @@ check(A.api_info()["host"] == "34.1.2.3", "falls back to detected public IP (clo
 A.write(ip_file, "[2001:4860::8] ")
 check(A.api_info()["host"] == "2001:4860::8", "public IPv6 from server_ip.log used (brackets stripped)")
 A.detect_public_ip = old_detect
+# ---------------- 重放防护：NaN 时间戳、进程启动前签发的请求
+_api = A.Api({"token": "t" * 32})
+def _rejects(ts):
+    try:
+        _api.check_replay({"ts": ts, "nonce": "n" * 20 + str(ts)})
+        return False
+    except ValueError:
+        return True
+check(_rejects(float("nan")) and _rejects(float("inf")), "replay check rejects NaN/inf timestamps")
+check(_rejects(A.START_TS - 60), "requests signed before agent start are rejected (nonce table is empty after restart)")
+check(not _rejects(time.time()), "fresh request accepted")
+# ---------------- 慢速滴灌：读取请求体有总时限
+import socket as _s
+_h = A.Handler.__new__(A.Handler)
+_a, _b = _s.socketpair()
+_h.connection = _a; _h.rfile = _a.makefile("rb"); _h.BODY_DEADLINE = 1
+_b.sendall(b"abc")
+_t0 = time.time()
+try:
+    _h.read_body(10); _slow = False
+except Exception:
+    _slow = True
+check(_slow and time.time() - _t0 < 5, "slow request body is cut off by the total deadline")
+_a.close(); _b.close()
 os.remove(A.API_CONF)
 shutil.rmtree(T, ignore_errors=True)
 print("FAILS:", fails); sys.exit(1 if fails else 0)

@@ -5,6 +5,9 @@ on:
 #  - cron: '*/10 * * * *' # 每10分钟执行一次（公开库每月2000分钟运行时长，每天64分钟）
   workflow_dispatch: 
 
+permissions:
+  contents: read
+
 jobs:
   fetch-urls:
     runs-on: ubuntu-latest
@@ -14,11 +17,13 @@ jobs:
       uses: actions/checkout@v5
 
     - name: Fetch URLs in parallel
+      env:
+        HTTP_URLS: ${{ secrets.http }}
       # secrets设置，变量名称：http
       # 变量值要求：每个保活/up网页或每个重启/re网页之间用空格或者，或者,间隔开，网页前带http://
       # 变量值填写示例：http://保活或重启网页1 http://保活或重启网页2 http://保活或重启网页3 ………
       run: |
-        IFS=$',， ' read -r -a http <<< "${{ secrets.http }}"
+        IFS=$',， ' read -r -a http <<< "$HTTP_URLS"
          echo "*****************************************************"
          echo "甬哥Github项目  ：github.com/yonggekkk"
          echo "甬哥Blogger博客 ：ygkkk.blogspot.com"

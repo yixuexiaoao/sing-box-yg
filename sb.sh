@@ -173,7 +173,7 @@ local chk=sbisip$f
 v=$(curl -s${f}m4 "$([[ $f == 4 ]] && echo https://1.1.1.1 || echo 'https://[2606:4700:4700::1111]')/cdn-cgi/trace" 2>/dev/null | sed -n 's/^ip=//p')
 $chk "$v" && { echo "$v"; return 0; }
 for u in icanhazip.com api64.ipify.org ifconfig.me ip.sb; do
-v=$(curl -s${f}m4 -k "https://$u" 2>/dev/null | tr -d ' \r\n')
+v=$(curl -s${f}m4 "https://$u" 2>/dev/null | tr -d ' \r\n')
 $chk "$v" && { echo "$v"; return 0; }
 done
 if [[ $f == 4 ]]; then
@@ -205,8 +205,8 @@ v4v6_start(){
 sbv46d=$(mktemp -d 2>/dev/null) || { sbv46d=/tmp/sbv4v6.$$; mkdir -p "$sbv46d"; }
 sbpubip 4 > "$sbv46d/v4" 2>/dev/null & sbv46p="$!"
 sbpubip 6 > "$sbv46d/v6" 2>/dev/null & sbv46p="$sbv46p $!"
-curl -s4m5 -k https://ip.fm > "$sbv46d/d4" 2>/dev/null & sbv46p="$sbv46p $!"
-curl -s6m5 -k https://ip.fm > "$sbv46d/d6" 2>/dev/null & sbv46p="$sbv46p $!"
+curl -s4m5 https://ip.fm > "$sbv46d/d4" 2>/dev/null & sbv46p="$sbv46p $!"
+curl -s6m5 https://ip.fm > "$sbv46d/d6" 2>/dev/null & sbv46p="$sbv46p $!"
 }
 v4v6_collect(){
 [[ -n $sbv46d ]] || v4v6_start
@@ -228,8 +228,8 @@ warpcheck(){
 [[ -n $sbwarpok ]] && return 0
 local f
 f=$(mktemp 2>/dev/null) || f=/tmp/sbwarp.$$
-curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep warp | cut -d= -f2 > "$f" &
-wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k 2>/dev/null | grep warp | cut -d= -f2)
+curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep warp | cut -d= -f2 > "$f" &
+wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep warp | cut -d= -f2)
 wait $! 2>/dev/null
 wgcfv6=$(cat "$f" 2>/dev/null)
 rm -f "$f"
@@ -4666,6 +4666,15 @@ x86_64) cpu=amd64;;
 *) red "WARP-plus-Socks5暂不支持$(uname -m)架构" && return 1;;
 esac
 curl -fL -o /etc/s-box/sbwpph -# --retry 2 ${sbrepo}/sbwpph_$cpu
+# 校验下载内容的 SHA256（与仓库内记录的程序一致才运行，避免下载损坏或被替换后以 root 执行）
+case $cpu in
+amd64) sbwpph_sha=93c7c5d7cb2c82cef44de782ae030b5f8fdb15038e3e95662e451bce7d3ee531;;
+arm64) sbwpph_sha=4a8f0419e4b848b99017128d532bd760f6daa4a7b0bc9f59ff166105db5c6e33;;
+esac
+if [[ $(sha256sum /etc/s-box/sbwpph 2>/dev/null | awk '{print $1}') != "$sbwpph_sha" ]]; then
+rm -f /etc/s-box/sbwpph
+red "WARP-plus-Socks5 程序下载失败或校验不通过（SHA256 不符），已删除，未运行" && return 1
+fi
 chmod +x /etc/s-box/sbwpph
 fi
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null

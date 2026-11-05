@@ -1,5 +1,21 @@
 # 变更日志
 
+## v26.11.16（2026-11-05）
+
+### 安全加固（代码审查）
+- **公网IP探测**：回退来源与 ip.fm、WARP 状态检测不再使用 `curl -k`，避免中间人伪造本机IP（影响节点链接与API对接地址）
+- **WARP-plus-Socks5（sbwpph）**：下载后校验 SHA256（与仓库内程序一致才运行），不符则删除并提示
+- **sbagent 1.4.3**：① 记录进程启动时间，重启后拒绝启动前签发的请求（内存 nonce 表清空后的重放窗口）；拒绝 NaN/inf 时间戳；② 请求体读取设总时限（15 秒）、连接空闲超时降为 10 秒，防止慢速滴灌占满 32 个并发连接
+- **CI**：`main.yml`、`config-check.yml` 增加 `permissions: contents: read`；`main.yml` 的 secret 改用环境变量传入，不再直接插值进 shell
+
+### 测试
+- `tests/test_sbagent.py`：新增 NaN/inf 时间戳、启动前签发请求被拒、慢速请求体被切断
+- `tests/core.sh`、`dns.sh`、`input.sh` 全部通过；`config_jq.sh` 需要 `jq`（本机未安装，未验证）；未进行 GUI 验证
+
+### 未解决 / 说明
+- 升级与内核下载仍依赖 HTTPS 与 GitHub 仓库可信，无独立签名（已在 SECURITY.md 说明）；sbwpph 的 SHA256 与程序同在本仓库，防损坏与传输篡改，不防仓库被控
+- TG / GitLab token 仍会出现在 root 脚本的命令行中（目录权限 700，影响有限）
+
 ## v26.11.15（2026-11-05）
 
 ### 修复
