@@ -386,8 +386,7 @@ fi
 # ---------------------------------------------------------------- Sing-box 内核下载
 # 原先：curl 不带 -f，GitHub 返回 404 时把错误页面存成 tar.gz；最新版本号靠抓取 GitHub 网页，取不到时下载地址变成 v/sing-box--linux-xxx；
 # 升级时下载失败或文件损坏，旧内核仍在原位，于是仍提示「成功升级」。现在下载到临时目录，解压并实际运行 `version` 校验后才替换
-SBCORE_DIR=${SBCORE_DIR:-/etc/s-box}
-SBCORE_URL=${SBCORE_URL:-https://github.com/SagerNet/sing-box/releases/download}
+# 下载地址与安装目录（测试时可用 SBCORE_URL/SBCORE_DIR 覆盖）：在每个函数内取默认值，不依赖脚本顶层的赋值
 sbcorevalid(){ [[ $1 =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(-(alpha|beta|rc)\.[0-9]{1,3})?$ ]]; }
 # 最新正式版（$1=pre 为测试版）：优先用主菜单已查询到的结果，其次 GitHub 跳转地址，最后 jsDelivr
 sbcorelatest(){
@@ -405,6 +404,7 @@ sbcorevalid "$v" && echo "$v"
 # 下载并校验内核：sbcorefetch 版本 → 解压后的可执行文件路径（临时目录中）；失败返回非0并说明原因
 sbcorefetch(){
 local ver=$1 name d
+: "${SBCORE_DIR:=/etc/s-box}" "${SBCORE_URL:=https://github.com/SagerNet/sing-box/releases/download}"
 sbcorevalid "$ver" || { red "内核版本号格式错误：$ver" >&2; return 1; }
 name="sing-box-$ver-linux-$cpu"
 d=$(mktemp -d "$SBCORE_DIR/.core.XXXXXX" 2>/dev/null) || { red "无法创建临时目录" >&2; return 1; }
@@ -423,6 +423,7 @@ echo "$d/$name/sing-box"
 # 替换内核：先写到同目录再 mv（原子替换，正在运行的旧内核不受影响）；旧内核保留为 sing-box.bak 供回滚
 sbcoreinstall(){
 local bin=$1 dir
+: "${SBCORE_DIR:=/etc/s-box}" "${SBCORE_URL:=https://github.com/SagerNet/sing-box/releases/download}"
 dir=${bin%/*}; dir=${dir%/*}
 [[ -f $SBCORE_DIR/sing-box ]] && cp -f "$SBCORE_DIR/sing-box" "$SBCORE_DIR/sing-box.bak"
 cp -f "$bin" "$SBCORE_DIR/sing-box.new" && chown root:root "$SBCORE_DIR/sing-box.new" 2>/dev/null
@@ -447,6 +448,7 @@ sbcore='1.10.7'
 fi
 # 端口设置需要知道内核系列（1.10 没有 Anytls），由版本号即可确定，不必等下载完成
 sbnh=$(echo "$sbcore" | cut -d '.' -f 1,2)
+: "${SBCORE_DIR:=/etc/s-box}" "${SBCORE_URL:=https://github.com/SagerNet/sing-box/releases/download}"
 blue "Sing-box 内核 $sbcore 将在后台下载，请继续完成以下设置"
 sbcorelog="$SBCORE_DIR/.core-download.log"
 ( SBCORE_QUIET=-sS sbcorefetch "$sbcore" > "$sbcorelog.out" 2> "$sbcorelog" ) &
@@ -454,6 +456,7 @@ sbcorepid=$!
 }
 sbcorewait(){
 local bin
+: "${SBCORE_DIR:=/etc/s-box}" "${SBCORE_URL:=https://github.com/SagerNet/sing-box/releases/download}"
 if [[ -n $sbcorepid ]] && kill -0 "$sbcorepid" 2>/dev/null; then
 blue "等待 Sing-box 内核下载完成……"
 fi
@@ -2966,11 +2969,17 @@ sbapido
 sbresult
 }
 
-# 仅 1.10 内核的 geosite 分流需要规则库（工作目录 /root），后台下载不阻塞安装
+# 仅 1.10 内核的 geosite 分流需要规则库（工作目录 /root），安装时后台下载不阻塞；sbgeodb fg 等待下载完成（切换内核后立即重启时使用）
 sbgeodb(){
 if [[ "$sbnh" == "1.10" && ! -s /root/geosite.db ]]; then
+if [[ $1 == fg ]]; then
+yellow "下载 1.10 内核分流所需的 geosite/geoip 规则库……"
+wget -q -T 30 -O /root/geoip.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db >/dev/null 2>&1
+wget -q -T 30 -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db >/dev/null 2>&1
+else
 (wget -q -O /root/geoip.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db
 wget -q -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db) >/dev/null 2>&1 &
+fi
 fi
 }
 
@@ -4368,7 +4377,7 @@ local bin num oldnh
 bin=$(sbcorefetch "$upcore") || { yellow "当前内核未做任何改动"; sleep 2; upsbcroe; return; }
 [[ $upcore == 1.10.* ]] && num=10 || num=11
 # 新内核不兼容当前配置时不替换（原先直接替换，sing-box 无法启动）
-if ! "$bin" check -c /etc/s-box/sb${num}.json >/dev/null 2>&1; then
+if ! (cd /root 2>/dev/null; "$bin" check -c /etc/s-box/sb${num}.json) >/dev/null 2>&1; then
 rm -rf "${bin%/*/*}"
 red "Sing-box $upcore 与当前配置不兼容（sing-box check 失败），当前内核未做任何改动" && sleep 2 && upsbcroe; return
 fi
@@ -4376,13 +4385,13 @@ oldnh=$sbnh
 cp -f /etc/s-box/sb.json /etc/s-box/sb.json.bak 2>/dev/null
 sbcoreinstall "$bin" || { red "替换内核失败，当前内核未做任何改动" && upsbcroe; return; }
 sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-sbgeodb
+sbgeodb fg
 rm -rf /etc/s-box/sb.json
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 restartsb
-# 新内核启动失败：恢复旧内核与配置
-local i ok=
-for i in 1 2 3 4 5 6; do sleep 1; if command -v apk >/dev/null 2>&1; then rc-service sing-box status 2>/dev/null | grep -qw started && ok=1; else systemctl is-active sing-box 2>/dev/null | grep -qx active && ok=1; fi; [[ -n $ok ]] && break; done
+# 新内核启动失败：恢复旧内核与配置。需连续5秒都在运行（启动后立即崩溃时，systemd 会短暂显示 active 后进入自动重启）
+local i ok=1
+for i in 1 2 3 4 5; do sleep 1; if command -v apk >/dev/null 2>&1; then rc-service sing-box status 2>/dev/null | grep -qw started || ok=; else systemctl is-active sing-box 2>/dev/null | grep -qx active || ok=; fi; done
 if [[ -z $ok && -f /etc/s-box/sing-box.bak ]]; then
 mv -f /etc/s-box/sing-box.bak /etc/s-box/sing-box
 [[ -f /etc/s-box/sb.json.bak ]] && mv -f /etc/s-box/sb.json.bak /etc/s-box/sb.json

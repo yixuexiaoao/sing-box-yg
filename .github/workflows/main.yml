@@ -11,7 +11,7 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v5
 
     - name: Fetch URLs in parallel
       # secrets设置，变量名称：http

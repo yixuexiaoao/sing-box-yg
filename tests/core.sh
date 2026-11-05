@@ -12,11 +12,12 @@ REL="$T/rel"; SBCORE_URL="file://$REL"
 command -v cygpath >/dev/null 2>&1 && SBCORE_URL="file:///$(cygpath -m "$REL")"
 SBCORE_QUIET=-sS
 # 假内核：可执行脚本，输出与 sing-box 相同格式的版本信息
-mkpkg(){ # mkpkg 版本 [broken|norun]
-local v=$1 n="sing-box-$1-linux-$cpu"
+mkpkg(){ # mkpkg 版本 [broken|norun|badcheck]
+local v=$1 n="sing-box-$1-linux-$cpu" chk=0
 mkdir -p "$T/build/$n" "$REL/v$v"
+[[ $2 == badcheck ]] && chk=1
 if [[ $2 == norun ]]; then printf 'ELF-not-for-this-cpu' > "$T/build/$n/sing-box"
-else printf '#!/bin/sh\necho "sing-box version %s"\n' "$v" > "$T/build/$n/sing-box"; fi
+else printf '#!/bin/sh\n[ "$1" = check ] && exit %s\necho "sing-box version %s"\n' "$chk" "$v" > "$T/build/$n/sing-box"; fi
 chmod 755 "$T/build/$n/sing-box"
 tar czf "$REL/v$v/$n.tar.gz" -C "$T/build" "$n"
 [[ $2 == broken ]] && head -c 40 "$REL/v$v/$n.tar.gz" > "$REL/v$v/x" && mv "$REL/v$v/x" "$REL/v$v/$n.tar.gz"
@@ -68,6 +69,42 @@ log="$SBCORE_DIR/.core-download.log"
 ( SBCORE_QUIET=-sS sbcorefetch 1.12.10 > "$log.out" 2> "$log" ) &
 wait $!
 t "background fetch writes binary path" "$([[ -x $(cat "$log.out") ]] && echo ok)" "ok"
+rm -rf "$(dirname "$(dirname "$(cat "$log.out")")")" "$log" "$log.out"
+
+# 只提取函数（CI 与 sbagent 以外的调用方式）、未设置 SBCORE_URL 时，下载地址仍指向 GitHub
+# （v26.11.14 的 CI 失败：默认地址写在脚本顶层，单独使用函数时地址为空）
+url=$(env -u SBCORE_URL SBCORE_DIR="$SBCORE_DIR" bash -c "source <(sed -n '/^red(){/p;/^sbcorevalid(){/p;/^sbcorefetch(){/,/^}/p' sb.sh); cpu=amd64
+  curl(){ while [[ \$# -gt 1 ]]; do shift; done; echo \"\$1\" > '$T/url'; return 22; }; sbcorefetch 1.12.10" >/dev/null 2>&1; cat "$T/url" 2>/dev/null)
+t "default download URL without top-level vars" "$url" "https://github.com/SagerNet/sing-box/releases/download/v1.12.10/sing-box-1.12.10-linux-amd64.tar.gz"
+
+# 主菜单8 升级/切换内核（upsbcroe）：路径替换到临时目录，交互与服务管理用桩函数
+source <(sed -n '/^upsbcroe(){/,/^}/p' sb.sh | sed "s#/etc/s-box#$SBCORE_DIR#g")
+upgrade(){ # upgrade 版本 "is-active 输出序列"（逐次取用，用完后重复最后一个）
+printf '%s\n' 3 "$1" 0 > "$T/answers"; printf '%s\n' $2 > "$T/states"; : > "$T/restarts"
+printf '#!/bin/sh\necho "sing-box version 1.11.0"\n' > "$SBCORE_DIR/sing-box"; chmod 755 "$SBCORE_DIR/sing-box"
+rm -f "$SBCORE_DIR/sing-box.bak"; echo old-config > "$SBCORE_DIR/sb.json"; echo new-config > "$SBCORE_DIR/sb11.json"
+( readp(){ local a; a=$(head -n1 "$T/answers"); sed -i 1d "$T/answers"; printf -v "$2" '%s' "$a"; }
+  sb(){ exit 0; }; sbactive(){ :; }; lapre(){ inscore=1.11.0; }; sbgeodb(){ :; }; sbshare(){ :; }; sbdiag(){ :; }; sleep(){ :; }
+  restartsb(){ echo restart >> "$T/restarts"; }
+  systemctl(){ [[ $1 == is-active ]] || return 0; head -n1 "$T/states"; [[ $(wc -l < "$T/states") -gt 1 ]] && sed -i 1d "$T/states"; return 0; }
+  upsbcroe ) > "$T/up.out" 2>&1
+}
+mkpkg 1.12.20
+upgrade 1.12.20 active
+t "menu 8: upgrade replaces core" "$("$SBCORE_DIR/sing-box" version)" "sing-box version 1.12.20"
+t "menu 8: old core kept, config from sb11.json" "$("$SBCORE_DIR/sing-box.bak" version) $(cat "$SBCORE_DIR/sb.json")" "sing-box version 1.11.0 new-config"
+t "menu 8: success message" "$(grep -c '成功升级/切换' "$T/up.out")" "1"
+mkpkg 1.12.21 badcheck
+upgrade 1.12.21 active
+t "menu 8: incompatible config -> core and config untouched" "$("$SBCORE_DIR/sing-box" version) $(cat "$SBCORE_DIR/sb.json") $(wc -l < "$T/restarts" | tr -d ' ')" "sing-box version 1.11.0 old-config 0"
+t "menu 8: incompatible message" "$(grep -c '不兼容' "$T/up.out")" "1"
+upgrade 1.12.20 failed
+t "menu 8: start failure -> old core and config restored" "$("$SBCORE_DIR/sing-box" version) $(cat "$SBCORE_DIR/sb.json") $(wc -l < "$T/restarts" | tr -d ' ')" "sing-box version 1.11.0 old-config 2"
+upgrade 1.12.20 "active active activating"
+t "menu 8: active then crash-looping -> rolled back" "$("$SBCORE_DIR/sing-box" version) $(grep -c '启动失败，已恢复' "$T/up.out")" "sing-box version 1.11.0 1"
+upgrade 1.99.9 active
+t "menu 8: missing version -> untouched" "$("$SBCORE_DIR/sing-box" version) $(grep -c '未做任何改动' "$T/up.out")" "sing-box version 1.11.0 1"
+t "menu 8: no temp dirs left" "$(ls -A "$SBCORE_DIR" | grep -c '^\.core\.')" "0"
 
 # warpcheck：安装期间已检测过时不再访问网络
 curl(){ echo called >> "$T/curl.calls"; }

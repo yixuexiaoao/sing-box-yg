@@ -21,7 +21,7 @@ jobs:
       matrix:
         core: [latest, prerelease, '1.10.7']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download sing-box
         id: dl
@@ -171,7 +171,7 @@ jobs:
   agent:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: sbagent syntax (python 3)
         run: python3 -m py_compile sbagent.py && python3 sbagent.py --help > /dev/null
       - name: shell syntax
