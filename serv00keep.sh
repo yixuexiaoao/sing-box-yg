@@ -42,7 +42,7 @@ devil www add ${USERNAME}.serv00.net php > /dev/null 2>&1
 FILE_PATH="${HOME}/domains/${USERNAME}.serv00.net/public_html"
 WORKDIR="${HOME}/domains/${USERNAME}.serv00.net/logs"
 [ -d "$FILE_PATH" ] || mkdir -p "$FILE_PATH"
-[ -d "$WORKDIR" ] || (mkdir -p "$WORKDIR" && chmod 777 "$WORKDIR")
+[ -d "$WORKDIR" ] || (mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR")
 keep_path="${HOME}/domains/${snb}.${USERNAME}.serv00.net/public_nodejs"
 [ -d "$keep_path" ] || mkdir -p "$keep_path"
 

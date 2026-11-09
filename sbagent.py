@@ -38,7 +38,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -464,9 +464,7 @@ def query_logs(p):
     sel = filter_recs(recs, p.get("hours"), p.get("ip"), p.get("q"), p.get("proto"),
                       bool(p.get("err")), bool(p.get("hidelocal")), p.get("ipx"))
     limit = max(1, min(int(p.get("limit") or 200), 5000))
-    sel = sel[-limit:][::-1]
-    for r in sel:
-        r["time"] = fmt_ts(r["t"])
+    sel = [dict(r, time=fmt_ts(r["t"])) for r in sel[-limit:][::-1]]  # 复制：缓存的记录被多个请求线程共享，不能就地修改
     info = log_info()
     info.update(records=sel, matched=len(sel), total=len(recs),
                 first=fmt_ts(recs[0]["t"]) if recs else "", last=fmt_ts(recs[-1]["t"]) if recs else "")
@@ -1145,18 +1143,30 @@ def read_nic():
     return {k: v for k, v in out.items() if not k.startswith(VIRTUAL_NIC)}
 
 
+_DB_READY = False
+# 版本 >= 3.24 才支持 UPSERT；更老的系统回退到 INSERT OR IGNORE + UPDATE
+HAS_UPSERT = sqlite3 is not None and sqlite3.sqlite_version_info >= (3, 24, 0)
+
+
 def db_connect():
+    global _DB_READY
     if sqlite3 is None:
         raise RuntimeError("当前 python3 缺少 sqlite3 模块")
+    if _DB_READY and not os.path.exists(TRAFFIC_DB):
+        _DB_READY = False  # 数据库文件被删除后需要重建表
     con = sqlite3.connect(TRAFFIC_DB, timeout=15)
+    con.create_function("root_domain", 1, root_domain)
+    if _DB_READY:  # 建表/建索引只在每个进程首次连接时执行（原先每次刷新写入、每次查询都执行）
+        return con
     con.execute("CREATE TABLE IF NOT EXISTS traffic(hour INTEGER, src TEXT, host TEXT, inbound TEXT, outbound TEXT,"
                 " up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, conns INTEGER DEFAULT 0,"
                 " PRIMARY KEY(hour, src, host, inbound, outbound))")
     con.execute("CREATE TABLE IF NOT EXISTS total(hour INTEGER PRIMARY KEY, up INTEGER DEFAULT 0, down INTEGER DEFAULT 0)")
     con.execute("CREATE TABLE IF NOT EXISTS nic(hour INTEGER PRIMARY KEY, rx INTEGER DEFAULT 0, tx INTEGER DEFAULT 0)")
-    con.create_function("root_domain", 1, root_domain)
     con.execute("CREATE INDEX IF NOT EXISTS idx_traffic_src ON traffic(src)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_traffic_host ON traffic(host)")
+    con.commit()
+    _DB_READY = True
     return con
 
 
@@ -1257,16 +1267,27 @@ class TrafficCollector(threading.Thread):
         con = db_connect()
         try:
             with con:
-                for k, (u, d, n) in buckets.items():
-                    con.execute("INSERT OR IGNORE INTO traffic(hour,src,host,inbound,outbound) VALUES(?,?,?,?,?)", k)
-                    con.execute("UPDATE traffic SET up=up+?, down=down+?, conns=conns+? WHERE hour=? AND src=? AND host=?"
-                                " AND inbound=? AND outbound=?", (u, d, n) + k)
-                for h, (u, d) in totals.items():
-                    con.execute("INSERT OR IGNORE INTO total(hour) VALUES(?)", (h,))
-                    con.execute("UPDATE total SET up=up+?, down=down+? WHERE hour=?", (u, d, h))
-                for h, (r, t) in nic.items():
-                    con.execute("INSERT OR IGNORE INTO nic(hour) VALUES(?)", (h,))
-                    con.execute("UPDATE nic SET rx=rx+?, tx=tx+? WHERE hour=?", (r, t, h))
+                if HAS_UPSERT:  # 每行一条语句、批量执行（原先每行 INSERT OR IGNORE + UPDATE 两条）
+                    con.executemany(
+                        "INSERT INTO traffic(hour,src,host,inbound,outbound,up,down,conns) VALUES(?,?,?,?,?,?,?,?)"
+                        " ON CONFLICT(hour,src,host,inbound,outbound) DO UPDATE SET up=up+excluded.up,"
+                        " down=down+excluded.down, conns=conns+excluded.conns",
+                        [k + (u, d, n) for k, (u, d, n) in buckets.items()])
+                    con.executemany("INSERT INTO total(hour,up,down) VALUES(?,?,?) ON CONFLICT(hour) DO UPDATE SET"
+                                    " up=up+excluded.up, down=down+excluded.down", [(h, u, d) for h, (u, d) in totals.items()])
+                    con.executemany("INSERT INTO nic(hour,rx,tx) VALUES(?,?,?) ON CONFLICT(hour) DO UPDATE SET"
+                                    " rx=rx+excluded.rx, tx=tx+excluded.tx", [(h, r, t) for h, (r, t) in nic.items()])
+                else:
+                    for k, (u, d, n) in buckets.items():
+                        con.execute("INSERT OR IGNORE INTO traffic(hour,src,host,inbound,outbound) VALUES(?,?,?,?,?)", k)
+                        con.execute("UPDATE traffic SET up=up+?, down=down+?, conns=conns+? WHERE hour=? AND src=? AND host=?"
+                                    " AND inbound=? AND outbound=?", (u, d, n) + k)
+                    for h, (u, d) in totals.items():
+                        con.execute("INSERT OR IGNORE INTO total(hour) VALUES(?)", (h,))
+                        con.execute("UPDATE total SET up=up+?, down=down+? WHERE hour=?", (u, d, h))
+                    for h, (r, t) in nic.items():
+                        con.execute("INSERT OR IGNORE INTO nic(hour) VALUES(?)", (h,))
+                        con.execute("UPDATE nic SET rx=rx+?, tx=tx+? WHERE hour=?", (r, t, h))
         finally:
             con.close()
 

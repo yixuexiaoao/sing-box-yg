@@ -404,6 +404,22 @@ check(A.api_info()["host"] == "34.1.2.3", "falls back to detected public IP (clo
 A.write(ip_file, "[2001:4860::8] ")
 check(A.api_info()["host"] == "2001:4860::8", "public IPv6 from server_ip.log used (brackets stripped)")
 A.detect_public_ip = old_detect
+# ---------------- 流量落库：重复 flush 同一桶应累加（UPSERT 路径与旧 sqlite 回退路径结果一致）
+_orig_upsert = A.HAS_UPSERT
+for _mode in (True, False):
+    A.HAS_UPSERT = _mode
+    _HH = H + 86400 * 30
+    _C3 = A.TrafficCollector()
+    for _ in range(2):
+        _C3.buckets[(_HH, "9.9.9.9", "z.com", "in", "out")] = [5, 6, 1]
+        _C3.totals[_HH] = [5, 6]
+        _C3.nic[_HH] = [7, 8]
+        _C3.flush()
+    _q = A.query_traffic({"start": _HH, "end": _HH + 3600, "group": "ip"})
+    check(_q["rows"][0]["up"] == 10 and _q["rows"][0]["conns"] == 2 and _q["total"]["down"] == 12 and _q["nic"]["rx"] == 14,
+          "flush accumulates repeated buckets (upsert=%s)" % _mode)
+    A.purge_traffic({"start": _HH, "end": _HH + 3600})
+A.HAS_UPSERT = _orig_upsert
 # ---------------- 重放防护：NaN 时间戳、进程启动前签发的请求
 _api = A.Api({"token": "t" * 32})
 def _rejects(ts):
