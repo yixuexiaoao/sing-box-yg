@@ -224,6 +224,32 @@ for _ in range(10):
 check(call("ping")[0] == 404 and "127.0.0.1" in srv.api.banned, "banned after 10 failed auths (even with good token)")
 check(any("封禁" in (e.get("error") or "") for e in A.api_log_read({})["entries"]), "ban recorded in audit log")
 srv.shutdown()
+# 1.4.5：IPv6 按 /64 计数封禁；无效白名单条目不退化为全部放行；过期封禁/失败记录清理；nonce 只弹出过期项
+api2 = A.Api({"token": "tok-1234567890abcdef", "allow": []})
+check(A.fail_key("2001:db8:1:2::5") == A.fail_key("2001:db8:1:2:ffff::9") == "2001:db8:1:2::/64"
+      and A.fail_key("1.2.3.4") == "1.2.3.4", "fail key: IPv6 /64, IPv4 per address")
+for i in range(10):
+    api2.record_fail("2001:db8:1:2::%x" % (i + 1), "x")
+check(not api2.permitted_ip("2001:db8:1:2::abcd") and api2.permitted_ip("2001:db8:1:3::1"), "IPv6 ban covers the /64 only")
+api2.allow = ["bad-net"]
+check(not api2.permitted_ip("1.2.3.4"), "whitelist with only invalid entries rejects all")
+api2.allow = ["1.2.3.0/24"]
+check(api2.permitted_ip("1.2.3.9") and not api2.permitted_ip("1.2.4.9") and not api2.permitted_ip("::1"), "whitelist re-parsed after change")
+api2.banned["x"] = time.time() - 1
+api2.fails["y"] = [time.time() - 700]
+api2.cleanup()
+check("x" not in api2.banned and "y" not in api2.fails and "2001:db8:1:2::/64" in api2.banned, "cleanup drops expired bans/fails only")
+api2.nonces["old"] = time.time() - 700
+api2.nonces["new"] = time.time()
+api2.check_replay({"ts": time.time(), "nonce": "n" * 16})
+check("old" not in api2.nonces and "new" in api2.nonces, "expired nonces pruned")
+now_t = time.time()
+recs = [{"t": now_t - 7200 + i * 60, "src": "1.1.1.%d" % (i % 3), "dst": "a.com:443"} for i in range(120)]
+check(len(A.filter_recs(recs, 1)) == len([r for r in recs if r["t"] >= now_t - 3600])
+      and A.filter_recs(recs) == recs and A.filter_recs(recs) is not recs
+      and len(A.filter_recs(recs, 1, ip_exact="1.1.1.0")) == len([r for r in recs if r["t"] >= now_t - 3600 and r["src"] == "1.1.1.0"]),
+      "filter_recs with time-window bisect")
+check(A._first_since(recs, 0) == 0 and A._first_since(recs, now_t + 1) == len(recs) and A._first_since([], 5) == 0, "bisect bounds")
 check(A.parse_perms("links") == ["read", "links"] and A.parse_allow("1.2.3.4, 10.0.0.0/8") == ["1.2.3.4", "10.0.0.0/8"], "perm/allow parsing")
 for bad_v, fn in (("root", A.parse_perms), ("1.2.3.4/99", A.parse_allow)):
     try:

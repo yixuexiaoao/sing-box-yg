@@ -38,7 +38,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -426,10 +426,26 @@ def rec_host(r):
     return split_hostport(rec_target(r))[0]
 
 
+def _first_since(recs, since):
+    """记录按时间追加（基本有序），二分找到第一条 t >= since 的位置，避免逐条扫描整个时间窗之外的记录。"""
+    lo, hi = 0, len(recs)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if recs[mid]["t"] < since:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
 def filter_recs(recs, hours=None, ip=None, q=None, proto=None, only_err=False, hide_local=False, ip_exact=None):
     since = time.time() - float(hours) * 3600 if hours else 0
     q = (q or "").lower()
     out = []
+    if since:
+        recs = recs[_first_since(recs, since):]
+    if not (ip or ip_exact or proto or only_err or hide_local or q):
+        return list(recs)
     for r in recs:
         if since and r["t"] < since:
             continue
@@ -477,6 +493,8 @@ def query_stats(p):
     recs = filter_recs(all_records(), hours)
     by_ip = {}
     by_dest = {}
+    hosts = {}  # 目标 -> 主机名：同一目标大量重复，缓存避免逐条拆分 host:port
+    errors = 0
     for r in recs:
         s = by_ip.get(r["src"])
         if s is None:
@@ -488,7 +506,11 @@ def query_stats(p):
             s["protos"].add(r["proto"])
         if r.get("err"):
             s["err"] += 1
-        host = rec_host(r)
+            errors += 1
+        tgt = r.get("domain") or r.get("dst") or ""
+        host = hosts.get(tgt)
+        if host is None:
+            host = hosts[tgt] = split_hostport(tgt)[0]
         if host:
             s["dests"][host] += 1
             d = by_dest.get(host)
@@ -502,7 +524,7 @@ def query_stats(p):
     return {
         "hours": hours,
         "conns": len(recs),
-        "errors": sum(1 for r in recs if r.get("err")),
+        "errors": errors,
         "unique_ips": len([i for i in by_ip if i and not is_local_ip(i)]),
         "unique_dests": len(by_dest),
         "ips": [{"ip": s["ip"], "count": s["count"], "err": s["err"], "first": fmt_ts(s["first"]),
@@ -1889,18 +1911,42 @@ def api_log_read(p):
     return {"entries": [e for e in (load_json_str(l) for l in reversed(lines)) if e]}
 
 
+def parse_nets(nets):
+    out = []
+    for n in nets:
+        try:
+            out.append(ipaddress.ip_network(n, strict=False))
+        except ValueError:
+            continue
+    return out
+
+
 def ip_in(ip, nets):
+    """nets 可以是字符串或已解析的 ip_network（Api 会缓存解析结果，避免每个请求重复解析）。"""
     try:
         addr = ipaddress.ip_address(norm_ip(ip))
     except ValueError:
         return False
     for n in nets:
-        try:
-            if addr in ipaddress.ip_network(n, strict=False):
-                return True
-        except ValueError:
-            continue
+        if isinstance(n, str):
+            n = parse_nets([n])
+            if not n:
+                continue
+            n = n[0]
+        if addr.version == n.version and addr in n:
+            return True
     return False
+
+
+def fail_key(ip):
+    """失败计数/封禁的单位：IPv4 按单个地址，IPv6 按 /64（攻击者通常拥有整个 /64，可随意换地址绕过按地址封禁）。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        return str(ipaddress.ip_network((addr, 64), strict=False))
+    return ip
 
 
 class Api(object):
@@ -1913,8 +1959,9 @@ class Api(object):
         self.path = conf.get("path") or "/api"
         self.perms = set(conf.get("perms") or PERMS)
         self.allow = list(conf.get("allow") or [])
+        self._nets = (None, [])  # (对应的 allow 列表, 预解析的网段)：避免每个请求重复解析白名单
         self.reset_interval = int(conf.get("reset_interval", 600))
-        self.nonces = {}
+        self.nonces = collections.OrderedDict()  # nonce -> 收到时间，按插入顺序即时间顺序
         self.fails = {}
         self.banned = {}
         self.lock = threading.Lock()
@@ -1923,25 +1970,42 @@ class Api(object):
     def permitted_ip(self, ip):
         """白名单与封禁检查，在读取请求体之前进行。"""
         now = time.time()
+        key = fail_key(ip)
         with self.lock:
-            until = self.banned.get(ip)
+            until = self.banned.get(key)
             if until and until > now:
                 return False
             if until:
-                del self.banned[ip]
-        return not self.allow or ip_in(ip, self.allow)
+                del self.banned[key]
+        if not self.allow:
+            return True
+        src, nets = self._nets
+        if src is not self.allow:
+            nets = parse_nets(self.allow)  # 条目全部无效时 nets 为空 → 全部拒绝（不退化为全部放行）
+            self._nets = (self.allow, nets)
+        return ip_in(ip, nets)
 
     def record_fail(self, ip, reason):
         now = time.time()
+        key = fail_key(ip)
         with self.lock:
-            lst = [t for t in self.fails.get(ip, []) if now - t < 600] + [now]
-            self.fails[ip] = lst
+            lst = [t for t in self.fails.get(key, []) if now - t < 600] + [now]
+            self.fails[key] = lst
             if len(lst) >= self.BAN_FAILS:
-                self.banned[ip] = now + self.BAN_SECONDS
-                self.fails.pop(ip, None)
-                api_log({"ip": ip, "action": "-", "ok": False, "error": "认证失败过多，封禁%d分钟" % (self.BAN_SECONDS // 60)})
+                self.banned[key] = now + self.BAN_SECONDS
+                self.fails.pop(key, None)
+                api_log({"ip": key, "action": "-", "ok": False, "error": "认证失败过多，封禁%d分钟" % (self.BAN_SECONDS // 60)})
             if len(self.fails) > 10000:
                 self.fails.clear()
+
+    def cleanup(self):
+        """由后台线程定期调用：清理过期封禁与失败记录，避免大量不同来源长期占用内存。"""
+        now = time.time()
+        with self.lock:
+            for k in [k for k, v in self.banned.items() if v <= now]:
+                del self.banned[k]
+            for k in [k for k, v in self.fails.items() if not v or now - v[-1] >= 600]:
+                del self.fails[k]
 
     def check_replay(self, req):
         now = time.time()
@@ -1950,9 +2014,13 @@ class Api(object):
         if not math.isfinite(ts) or abs(now - ts) > 300 or ts < START_TS - 5 or len(nonce) < 16:
             raise ValueError("expired")
         with self.lock:
-            for k in [k for k, v in self.nonces.items() if now - v > 600]:
-                del self.nonces[k]
-            if nonce in self.nonces:
+            nonces = self.nonces
+            while nonces:  # 按时间顺序，只弹出已过期的，不必每次遍历全部
+                k, v = next(iter(nonces.items()))
+                if now - v <= 600:
+                    break
+                del nonces[k]
+            if nonce in nonces:
                 raise ValueError("replay")
             self.nonces[nonce] = now
         return nonce
@@ -2125,6 +2193,7 @@ def serve():
             time.sleep(60)
             n += 1
             LOG_INDEX.drop_if_idle()
+            srv.api.cleanup()
             try:
                 if n % 5 == 0:  # 每5分钟按日志策略轮转/压缩/清理
                     rotate()
@@ -2132,8 +2201,8 @@ def serve():
                     purge_traffic({"days": traffic_conf().get("retain_days", 90)})
             except Exception as e:
                 sys.stderr.write("sbagent janitor: %s\n" % e)
-    threading.Thread(target=janitor, daemon=True).start()
     srv = make_server(conf)
+    threading.Thread(target=janitor, daemon=True).start()
     sys.stderr.write("sbagent %s API listening on %s:%s%s\n" % (VERSION, conf.get("listen") or "::",
                                                               conf["port"], srv.api.path))
     srv.serve_forever()
