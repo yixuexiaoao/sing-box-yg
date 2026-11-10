@@ -15,6 +15,7 @@
 
 ### 测试
 - `tests/test_sbagent.py`：新增 IPv6 /64 封禁、无效白名单全部拒绝、白名单修改后重新解析、过期封禁/失败清理、nonce 过期弹出、时间窗二分筛选与边界
+- 修正：时间窗筛选测试中有记录正好落在起点边界，Linux 时钟精度高时被排除，CI 失败（Windows 上未暴露）；记录改为错开边界 30 秒
 - `test_sbagent.py`、`core.sh`、`dns.sh`、`input.sh` 全部通过；`config_jq.sh` 需要 `jq`（本机未安装，未验证）；面板端到端测试（e2e.mjs，连接本版 sbagent）142 项全部通过；未进行 GUI 验证
 
 ### 未解决 / 说明

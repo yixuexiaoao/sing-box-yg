@@ -244,7 +244,8 @@ api2.nonces["new"] = time.time()
 api2.check_replay({"ts": time.time(), "nonce": "n" * 16})
 check("old" not in api2.nonces and "new" in api2.nonces, "expired nonces pruned")
 now_t = time.time()
-recs = [{"t": now_t - 7200 + i * 60, "src": "1.1.1.%d" % (i % 3), "dst": "a.com:443"} for i in range(120)]
+# 记录时间错开整分钟边界 30 秒：filter_recs 内部用稍后的 time.time() 计算起点，Linux 时钟精度高，正好落在边界的记录会被排除
+recs = [{"t": now_t - 7200 + 30 + i * 60, "src": "1.1.1.%d" % (i % 3), "dst": "a.com:443"} for i in range(120)]
 check(len(A.filter_recs(recs, 1)) == len([r for r in recs if r["t"] >= now_t - 3600])
       and A.filter_recs(recs) == recs and A.filter_recs(recs) is not recs
       and len(A.filter_recs(recs, 1, ip_exact="1.1.1.0")) == len([r for r in recs if r["t"] >= now_t - 3600 and r["src"] == "1.1.1.0"]),
