@@ -38,6 +38,12 @@
 
 ## 本次审计修复的问题
 
+### v26.11.19 公告核对
+
+- **CVE-2023-43644** 涉及旧版 sing-box 带用户认证的 SOCKS 入站。当前 VPS 默认安装选项避开了公告列出的版本，但旧版本可通过指定版本入口下载。从 v26.11.19 起，VPS 脚本和 sbagent 阻止重新安装这些旧版本。升级脚本本身不会替换已装内核。[SagerNet 公告](https://github.com/advisories/GHSA-r5hm-mp3j-285g)
+- **压缩请求资源消耗**。sbagent 先验证报文签名，再限制解压后的管理请求最多 2 MiB。远程更新脚本必须通过 `bash -n` 才能替换现有文件。[CWE-409](https://cwe.mitre.org/data/definitions/409.html)
+- **传输身份校验**。`kp.sh` 和 `SSH.yml` 接受经核验的 SSH 主机密钥。VPS 网络探测及保活工作流启用 HTTPS 证书校验。支持的 HTTP 保活端点仍以明文传输。[OpenSSH 配置手册](https://man.openbsd.org/ssh_config) · [curl TLS 校验](https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYPEER.html)
+
 | 级别 | 问题 | 来源 |
 |---|---|---|
 | 高 | 脚本自更新与 WARP-plus 程序下载使用 `curl --insecure`（不校验 HTTPS 证书），可被中间人替换为任意以 root 运行的代码 | 原版遗留 |

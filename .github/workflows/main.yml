@@ -32,14 +32,17 @@ jobs:
          echo "请先确认已成功安装甬哥的serv00的SSH脚本或者Github/VPS/软路由脚本"
          echo "脚本地址：https://github.com/yonggekkk/sing-box-yg"
          echo "*****************************************************"
-        for url in "${http[@]}"; do
-          response=$(curl -sk "$url" || true)
+        for i in "${!http[@]}"; do
+          url=${http[i]}
+          if ! response=$(curl --disable -fsS --max-time 20 --proto '=http,https' -- "$url" 2>/dev/null); then
+            response=
+          fi
           if [[ "$response" == *"网页保活启动"* ]]; then
-          echo "🎉恭喜！$url ✅运行正常，成功拉起一次保活"
+          echo "第 $((i + 1)) 个端点保活成功"
           elif [[ "$response" == *"主程序重启成功"* ]]; then
-          echo "🎉恭喜！$url ✅运行正常，成功重启一次主程序"
+          echo "第 $((i + 1)) 个端点重启成功"
           else
-         echo "💥杯具！$url ❌运行失败，⚠️网页变量是否填写正确？或者Serv00炸了"
+          echo "第 $((i + 1)) 个端点请求失败或返回了未知状态"
          fi
         done
         wait

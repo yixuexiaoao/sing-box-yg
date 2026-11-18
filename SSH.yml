@@ -4,14 +4,12 @@ on:
    - cron: '0 15 */8 * *'
   workflow_dispatch: 
 
+permissions:
+  contents: read
+
 jobs:
   keep_servers_alive:
     runs-on: ubuntu-latest
-    env:
-      ACCOUNTS: >
-        [
-        {"SSH_USER":"123456789", "SSH_PASS":"123456", "HOST":"sxxx.serv00.com"}
-        ]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4.2.2
@@ -22,7 +20,19 @@ jobs:
           sudo apt-get install -y sshpass jq
 
       - name: Process each account
+        env:
+          ACCOUNTS: ${{ secrets.SSH_ACCOUNTS }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
+           if [[ -z $SSH_KNOWN_HOSTS ]]; then
+             echo '缺少经过独立核验的 SSH_KNOWN_HOSTS'
+             exit 1
+           fi
+           umask 077
+           known_hosts=$(mktemp)
+           trap 'rm -f "$known_hosts"' EXIT
+           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$known_hosts"
+           accounts=$(jq -ce 'if type == "array" and length > 0 then .[] else error("invalid SSH_ACCOUNTS") end' <<< "$ACCOUNTS") || exit 1
            echo "*****************************************************"
            echo "*****************************************************"
            echo "甬哥Github项目  ：github.com/yonggekkk"
@@ -32,12 +42,13 @@ jobs:
            echo "*****************************************************"
            echo "*****************************************************"
             count=0  
-           for account in $(echo "${ACCOUNTS}" | jq -c '.[]'); do
+           while IFS= read -r account; do
               count=$((count+1))
-              SSH_USER=$(echo $account | jq -r '.SSH_USER')
-              SSH_PASS=$(echo $account | jq -r '.SSH_PASS')
-              HOST=$(echo $account | jq -r '.HOST')
-           if sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST" -q exit; then
+              SSH_USER=$(jq -er '.SSH_USER | select(type == "string" and length > 0)' <<< "$account") || exit 1
+              SSH_PASS=$(jq -er '.SSH_PASS | select(type == "string" and length > 0)' <<< "$account") || exit 1
+              HOST=$(jq -er '.HOST | select(type == "string" and length > 0)' <<< "$account") || exit 1
+           if SSHPASS=$SSH_PASS sshpass -e ssh -o StrictHostKeyChecking=yes -o VerifyHostKeyDNS=no -o ForwardAgent=no -o ConnectTimeout=15 \
+             -o "UserKnownHostsFile=$known_hosts" -o GlobalKnownHostsFile=/dev/null -l "$SSH_USER" -- "$HOST" exit; then
             echo "🎉恭喜！✅第【$count】台服务器连接成功！🚀服务器地址：$HOST ，账户名：$SSH_USER" 
            else
             echo "===================================================="
@@ -46,4 +57,4 @@ jobs:
             echo "===================================================="
            fi
            sleep 10
-            done
+            done <<< "$accounts"

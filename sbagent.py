@@ -38,7 +38,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -1490,11 +1490,13 @@ def first_version(text):
 def check_script(data):
     if not data.startswith(b"#!/bin/bash") or b"sbrepo=" not in data:
         raise RuntimeError("下载的 sb.sh 内容异常")
+    if not has("bash"):
+        raise RuntimeError("缺少 Bash，无法校验升级脚本语法")
     tmp = os.path.join(SB_DIR, ".sb.sh.check")
     with open(tmp, "wb") as f:
         f.write(data)
     try:
-        rc, out = runs(["bash", "-n", tmp]) if has("bash") else (0, "")
+        rc, out = runs(["bash", "-n", tmp])
     finally:
         os.remove(tmp)
     if rc != 0:
@@ -1591,6 +1593,16 @@ def ver_key(v):
     return nums + [0, {"alpha": 0, "beta": 1, "rc": 2}.get(kind, 0) * 1000 + int(n or 0)]
 
 
+def core_version_allowed(v):
+    if not isinstance(v, str) or not CORE_VERSION_RE.fullmatch(v):
+        return False
+    # GHSA-r5hm-mp3j-285g: 1.4.5 final and 1.5.0-rc.5 contain the SOCKS authentication fix.
+    key = ver_key(v)
+    if key[:3] == [1, 5, 0]:
+        return key >= ver_key("1.5.0-rc.5")
+    return key >= ver_key("1.4.5")
+
+
 def core_versions():
     """最新正式版与测试版（jsDelivr 优先，避免 GitHub API 频率限制）。"""
     vers = []
@@ -1601,7 +1613,7 @@ def core_versions():
     if not vers:
         rels = json.loads(http_get("https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30", 4 * 1024 * 1024))
         vers = [r.get("tag_name", "").lstrip("v") for r in rels]
-    vers = sorted({v for v in vers if CORE_VERSION_RE.match(v)}, key=ver_key, reverse=True)
+    vers = sorted({v for v in vers if core_version_allowed(v)}, key=ver_key, reverse=True)
     stable = [v for v in vers if "-" not in v]
     return {"latest": stable[0] if stable else "", "prerelease": vers[0] if vers and "-" in vers[0] else ""}
 
@@ -1616,8 +1628,10 @@ def do_core_upgrade(p=None):
     want = str(p.get("version") or "latest").strip()
     if want in ("latest", "prerelease"):
         want = core_versions().get(want) or ""
-    if not CORE_VERSION_RE.match(want):
+    if not CORE_VERSION_RE.fullmatch(want):
         raise ValueError("内核版本格式错误：%s（例：1.12.10 或 1.13.0-rc.1）" % want)
+    if not core_version_allowed(want):
+        raise ValueError("内核版本低于安全版本（CVE-2023-43644）：%s" % want)
     cpu = core_arch()
     if not cpu:
         raise RuntimeError("不支持的 CPU 架构，无法自动升级内核")
@@ -1642,7 +1656,7 @@ def do_core_upgrade(p=None):
         os.chmod(new_bin, 0o755)
         try:
             rc, out = runs([new_bin, "version"])
-            if rc != 0 or want not in out:
+            if rc != 0 or ("sing-box version " + want) not in out.splitlines():
                 raise RuntimeError("新内核无法运行或版本不符：" + out[:200])
             num = "10" if want.startswith("1.10.") else "11"
             cfg = os.path.join(SB_DIR, "sb%s.json" % num)
@@ -1834,7 +1848,7 @@ def seal(obj, keys):
     return {"v": 1, "iv": b64(iv), "ct": b64(ct), "z": 1 if z else 0, "mac": b64(mac)}
 
 
-def unseal(env, keys):
+def unseal(env, keys, max_plaintext=None):
     iv, ct, mac = (base64.b64decode(env[k]) for k in ("iv", "ct", "mac"))
     z = bool(env.get("z"))
     want = hmac.new(keys[1], mac_input(iv, ct, z), hashlib.sha256).digest()
@@ -1842,7 +1856,15 @@ def unseal(env, keys):
         raise ValueError("bad mac")
     pt = aes_cbc(ct, keys[0], iv, decrypt=True)
     if z:
-        pt = zlib.decompress(pt)
+        if max_plaintext is None:
+            pt = zlib.decompress(pt)
+        else:
+            decoder = zlib.decompressobj()
+            pt = decoder.decompress(pt, max_plaintext + 1)
+            if len(pt) > max_plaintext or not decoder.eof or decoder.unused_data:
+                raise ValueError("invalid or oversized compressed payload")
+    if max_plaintext is not None and len(pt) > max_plaintext:
+        raise ValueError("payload too large")
     return json.loads(pt.decode())
 
 
@@ -2026,7 +2048,7 @@ class Api(object):
         return nonce
 
     def handle(self, body, ip="-"):
-        req = unseal(json.loads(body.decode()), self.keys)
+        req = unseal(json.loads(body.decode()), self.keys, max_plaintext=2 * 1024 * 1024)
         nonce = self.check_replay(req)
         action = str(req.get("action"))
         params = req.get("params")

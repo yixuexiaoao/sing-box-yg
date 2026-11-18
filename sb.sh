@@ -249,10 +249,10 @@ SBDNS_MARK="# sing-box-yg: NAT64 DNS (backup: $SBDNS_BAK)"
 SBDNS_NAT64="2a00:1098:2b::1 2a00:1098:2c::1 2a01:4f8:c2c:123f::1"
 sbnet4(){
 ip -4 route show default 2>/dev/null | grep -q . || return 1
-curl -s4m5 -o /dev/null https://1.1.1.1/cdn-cgi/trace 2>/dev/null || curl -s4m5 -k -o /dev/null https://9.9.9.9 2>/dev/null || curl -s4m5 -k -o /dev/null icanhazip.com 2>/dev/null
+curl -s4m5 -o /dev/null https://1.1.1.1/cdn-cgi/trace 2>/dev/null || curl -s4m5 -o /dev/null --resolve dns.quad9.net:443:9.9.9.9 https://dns.quad9.net/dns-query 2>/dev/null || curl -s4m5 -o /dev/null https://icanhazip.com 2>/dev/null
 }
 sbnet6(){
-curl -s6m5 -o /dev/null "https://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null || curl -s6m5 -k -o /dev/null "https://[2620:fe::fe]" 2>/dev/null
+curl -s6m5 -o /dev/null "https://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null || curl -s6m5 -o /dev/null --resolve 'dns.quad9.net:443:[2620:fe::fe]' https://dns.quad9.net/dns-query 2>/dev/null
 }
 # 只含 NAT64 DNS 的 resolv.conf（本脚本写入，或旧版本写入的两行）
 sbdns_isnat64(){
@@ -387,7 +387,21 @@ fi
 # 原先：curl 不带 -f，GitHub 返回 404 时把错误页面存成 tar.gz；最新版本号靠抓取 GitHub 网页，取不到时下载地址变成 v/sing-box--linux-xxx；
 # 升级时下载失败或文件损坏，旧内核仍在原位，于是仍提示「成功升级」。现在下载到临时目录，解压并实际运行 `version` 校验后才替换
 # 下载地址与安装目录（测试时可用 SBCORE_URL/SBCORE_DIR 覆盖）：在每个函数内取默认值，不依赖脚本顶层的赋值
-sbcorevalid(){ [[ $1 =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(-(alpha|beta|rc)\.[0-9]{1,3})?$ ]]; }
+sbcorevalid(){
+[[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(-(alpha|beta|rc)\.([0-9]{1,3}))?$ ]] || return 1
+local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]})) patch=$((10#${BASH_REMATCH[3]}))
+local stage=${BASH_REMATCH[5]} serial=${BASH_REMATCH[6]:-0}
+# GHSA-r5hm-mp3j-285g：1.4.5 正式版及 1.5.0-rc.5 起修复 SOCKS 入站身份验证。
+((major > 1)) && return 0
+((major == 1)) || return 1
+if ((minor == 4)); then
+    ((patch > 5)) || { ((patch == 5)) && [[ -z $stage ]]; }
+elif ((minor == 5 && patch == 0)) && [[ -n $stage ]]; then
+    [[ $stage == rc ]] && ((10#$serial >= 5))
+else
+    ((minor >= 5))
+fi
+}
 # 最新正式版（$1=pre 为测试版）：优先用主菜单已查询到的结果，其次 GitHub 跳转地址，最后 jsDelivr
 sbcorelatest(){
 local v
@@ -405,7 +419,7 @@ sbcorevalid "$v" && echo "$v"
 sbcorefetch(){
 local ver=$1 name d
 : "${SBCORE_DIR:=/etc/s-box}" "${SBCORE_URL:=https://github.com/SagerNet/sing-box/releases/download}"
-sbcorevalid "$ver" || { red "内核版本号格式错误：$ver" >&2; return 1; }
+sbcorevalid "$ver" || { red "内核版本号格式错误或低于安全版本：$ver（CVE-2023-43644）" >&2; return 1; }
 name="sing-box-$ver-linux-$cpu"
 d=$(mktemp -d "$SBCORE_DIR/.core.XXXXXX" 2>/dev/null) || { red "无法创建临时目录" >&2; return 1; }
 if ! curl -fL --retry 2 --connect-timeout 15 ${SBCORE_QUIET:--#} -o "$d/core.tar.gz" "$SBCORE_URL/v$ver/$name.tar.gz"; then
@@ -415,7 +429,7 @@ if ! tar xzf "$d/core.tar.gz" -C "$d" "$name/sing-box" 2>/dev/null || [[ ! -s $d
 rm -rf "$d"; red "下载的 Sing-box 内核压缩包不完整或已损坏" >&2; return 1
 fi
 chmod 755 "$d/$name/sing-box"
-if ! "$d/$name/sing-box" version 2>/dev/null | grep -qF "$ver"; then
+if ! "$d/$name/sing-box" version 2>/dev/null | grep -Fxq "sing-box version $ver"; then
 rm -rf "$d"; red "下载的 Sing-box 内核无法在本机运行（CPU架构：$cpu）" >&2; return 1
 fi
 echo "$d/$name/sing-box"

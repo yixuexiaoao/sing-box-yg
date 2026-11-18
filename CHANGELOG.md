@@ -1,5 +1,23 @@
 # 变更日志
 
+## v26.11.19（2026-11-18）
+
+### 安全
+
+- VPS 安装脚本与 sbagent 内核切换共同拒绝受 SOCKS 入站认证漏洞影响的旧版本和修复前的预发行版，校验下载内核报告的完整版本号。当前默认安装选项均不在公告影响范围内。[CVE-2023-43644 / GHSA-r5hm-mp3j-285g](https://github.com/advisories/GHSA-r5hm-mp3j-285g)
+- sbagent 管理 API 对解压后的请求设 2 MiB 上限，脚本升级必须执行 Bash 语法校验。现有加密格式兼容 Worker 面板。[CWE-409](https://cwe.mitre.org/data/definitions/409.html)
+- Serv00 自动化 SSH 核验主机密钥，HTTPS 保活与 VPS 连通性探测核验服务器证书。保活工作流只记录端点编号。[OpenSSH 客户端配置](https://man.openbsd.org/ssh_config) · [curl TLS 校验](https://curl.se/libcurl/c/CURLOPT_SSL_VERIFYPEER.html)
+
+### 测试
+
+- Bash 语法检查及内核、DNS、输入回归通过。Windows 本地环境跳过 DNS 符号链接用例和仅 Linux 执行的 Python 内核替换用例。
+- sbagent 95 项和 Worker 至 sbagent 的 154 项端到端测试全部通过。两份工作流的 YAML、嵌入 Bash 和本地模拟正常。未连接实际 Serv00 主机。
+
+### 使用说明
+
+- `kp.sh` 需要预先配置可信的 `known_hosts`。`SSH.yml` 模板通过 `SSH_ACCOUNTS` 和 `SSH_KNOWN_HOSTS` Secrets 读取凭据和主机密钥。
+- 兼容现有 HTTP 保活端点。仅 HTTPS 连接具有 TLS 身份校验，现有 VPS 的内核版本仍需逐台核对。
+
 ## v26.11.18（2026-11-10）
 
 ### 性能

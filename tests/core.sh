@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sing-box 内核下载/校验/替换测试：从 sb.sh 提取真实函数，用本地假压缩包（file://）代替 GitHub（bash tests/core.sh）
 cd "$(dirname "$0")/.." || exit 1
-source <(sed -n '/^yellow(){/p;/^blue(){/p;/^red(){/p;/^green(){/p' sb.sh; sed -n '/^sbcorevalid(){/p;/^sbcorelatest(){/,/^}/p;/^sbcorefetch(){/,/^}/p;/^sbcoreinstall(){/,/^}/p;/^warpcheck(){/,/^}/p' sb.sh)
+source <(sed -n '/^yellow(){/p;/^blue(){/p;/^red(){/p;/^green(){/p' sb.sh; sed -n '/^sbcorevalid(){/,/^}/p;/^sbcorelatest(){/,/^}/p;/^sbcorefetch(){/,/^}/p;/^sbcoreinstall(){/,/^}/p;/^warpcheck(){/,/^}/p' sb.sh)
 export LANG=en_US.UTF-8
 fails=0; t(){ if [[ "$2" == "$3" ]]; then echo "PASS $1"; else echo "FAIL $1: got [$2] want [$3]"; fails=$((fails+1)); fi; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -27,6 +27,8 @@ return 0
 # 版本号格式
 for v in 1.12.10 1.10.7 1.13.0-rc.1 1.13.0-alpha.12; do t "valid version $v" "$(sbcorevalid "$v" && echo ok)" "ok"; done
 for v in '' v1.12.0 1.12 '1.2.3;id' '1.2.3 x' 1.13.0-dev.1 ../1.2.3; do t "invalid version [$v]" "$(sbcorevalid "$v" || echo no)" "no"; done
+for v in 1.4.4 1.4.5-rc.1 1.5.0-beta.1 1.5.0-rc.4; do t "security version rejected $v" "$(sbcorevalid "$v" || echo no)" "no"; done
+for v in 1.4.5 1.5.0-rc.5; do t "security fix accepted $v" "$(sbcorevalid "$v" && echo ok)" "ok"; done
 
 # 最新版本：优先使用主菜单已查询的结果（不访问网络）
 latcore=1.12.10 precore=1.13.0-beta.3
@@ -73,7 +75,7 @@ rm -rf "$(dirname "$(dirname "$(cat "$log.out")")")" "$log" "$log.out"
 
 # 只提取函数（CI 与 sbagent 以外的调用方式）、未设置 SBCORE_URL 时，下载地址仍指向 GitHub
 # （v26.11.14 的 CI 失败：默认地址写在脚本顶层，单独使用函数时地址为空）
-url=$(env -u SBCORE_URL SBCORE_DIR="$SBCORE_DIR" bash -c "source <(sed -n '/^red(){/p;/^sbcorevalid(){/p;/^sbcorefetch(){/,/^}/p' sb.sh); cpu=amd64
+url=$(env -u SBCORE_URL SBCORE_DIR="$SBCORE_DIR" bash -c "source <(sed -n '/^red(){/p;/^sbcorevalid(){/,/^}/p;/^sbcorefetch(){/,/^}/p' sb.sh); cpu=amd64
   curl(){ while [[ \$# -gt 1 ]]; do shift; done; echo \"\$1\" > '$T/url'; return 22; }; sbcorefetch 1.12.10" >/dev/null 2>&1; cat "$T/url" 2>/dev/null)
 t "default download URL without top-level vars" "$url" "https://github.com/SagerNet/sing-box/releases/download/v1.12.10/sing-box-1.12.10-linux-amd64.tar.gz"
 

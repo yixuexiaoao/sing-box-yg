@@ -11,6 +11,11 @@ ACCOUNTS='[
 {"RES":"n", "REP":"n", "SSH_USER":"你的serv00账号名", "SSH_PASS":"你的serv00账号密码", "REALITY":"你serv00账号名.serv00.net", "SUUID":"自设UUID", "TCP1_PORT":"vless的tcp端口", "TCP2_PORT":"vmess的tcp端口", "UDP_PORT":"hy2的udp端口", "HOST":"s1.serv00.com", "ARGO_DOMAIN":"", "ARGO_AUTH":""},
 {"RES":"y", "REP":"y", "SSH_USER":"123456", "SSH_PASS":"7890000", "REALITY":"time.is", "SUUID":"73203ee6-b3fa-4a3d-b5df-6bb2f55073ad", "TCP1_PORT":"", "TCP2_PORT":"", "UDP_PORT":"", "HOST":"s16.serv00.com", "ARGO_DOMAIN":"你的argo固定域名", "ARGO_AUTH":"eyJhIjoiOTM3YzFjYWI88552NTFiYTM4ZTY0ZDQzRmlNelF0TkRBd1pUQTRNVEJqTUdVeCJ9"}
 ]'
+serv00_ssh(){
+    local user=$1 host=$2 password=$3
+    shift 3
+    SSHPASS=$password sshpass -e ssh -o StrictHostKeyChecking=yes -o VerifyHostKeyDNS=no -o ForwardAgent=no -o ForwardX11=no -o ConnectTimeout=15 -l "$user" -- "$host" "$@"
+}
 run_remote_command() {
 local RES=$1
 local REP=$2
@@ -29,9 +34,18 @@ local ARGO_AUTH=${12}
   else
     echo "Argo已设置固定域名：${ARGO_DOMAIN}"
   fi
-  remote_command="export reym=$REALITY UUID=$SUUID vless_port=$TCP1_PORT vmess_port=$TCP2_PORT hy2_port=$UDP_PORT reset=$RES resport=$REP ARGO_DOMAIN=${ARGO_DOMAIN} ARGO_AUTH=${ARGO_AUTH} && bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00keep.sh)"
-  echo "Executing remote command on $HOST as $SSH_USER with command: $remote_command"
-  sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST" "$remote_command"
+  local remote_env
+  printf -v remote_env 'export reym=%q UUID=%q vless_port=%q vmess_port=%q hy2_port=%q reset=%q resport=%q ARGO_DOMAIN=%q ARGO_AUTH=%q' \
+    "$REALITY" "$SUUID" "$TCP1_PORT" "$TCP2_PORT" "$UDP_PORT" "$RES" "$REP" "$ARGO_DOMAIN" "$ARGO_AUTH"
+  {
+    printf '%s\n' "$remote_env"
+    cat <<'REMOTE'
+keep_script=$(mktemp) || exit 1
+trap 'rm -f "$keep_script"' EXIT
+curl --disable --proto '=https' --proto-redir '=https' -fsSL -o "$keep_script" \
+  https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00keep.sh && bash "$keep_script"
+REMOTE
+  } | serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" bash -s
 }
 if  cat /etc/issue /proc/version /etc/os-release 2>/dev/null | grep -q -E -i "openwrt"; then
 opkg update
@@ -73,22 +87,25 @@ echo "*****************************************************"
               HOST=$(echo $account | jq -r '.HOST')
               ARGO_DOMAIN=$(echo $account | jq -r '.ARGO_DOMAIN')
               ARGO_AUTH=$(echo $account | jq -r '.ARGO_AUTH') 
-          if sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST" -q exit; then
+          if serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" exit; then
             echo "🎉恭喜！✅第【$count】台服务器连接成功！🚀服务器地址：$HOST ，账户名：$SSH_USER"   
           if [ -z "${ARGO_DOMAIN}" ]; then
-           check_process="ps aux | grep '[c]onfig' > /dev/null && ps aux | grep [l]ocalhost:$TCP2_PORT > /dev/null"
+           printf -v check_process "ps aux | grep '[c]onfig' > /dev/null && ps aux | grep -- %q > /dev/null" "[l]ocalhost:$TCP2_PORT"
             else
-           check_process="ps aux | grep '[c]onfig' > /dev/null && ps aux | grep '[t]oken $ARGO_AUTH' > /dev/null"
+           printf -v check_process "ps aux | grep '[c]onfig' > /dev/null && ps aux | grep -- %q > /dev/null" "[t]oken $ARGO_AUTH"
            fi
-          if ! sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST" "$check_process" || [[ "$RES" =~ ^[Yy]$ ]]; then
+          if ! serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" "$check_process" || [[ "$RES" =~ ^[Yy]$ ]]; then
             echo "⚠️检测到主进程或者argo进程未启动，或者执行重置"
              echo "⚠️现在开始修复或重置部署……请稍等"
-             output=$(run_remote_command "$RES" "$REP" "$SSH_USER" "$SSH_PASS" "${REALITY}" "$SUUID" "$TCP1_PORT" "$TCP2_PORT" "$UDP_PORT" "$HOST" "${ARGO_DOMAIN}" "${ARGO_AUTH}")
-            echo "远程命令执行结果：$output"
+             if run_remote_command "$RES" "$REP" "$SSH_USER" "$SSH_PASS" "$REALITY" "$SUUID" "$TCP1_PORT" "$TCP2_PORT" "$UDP_PORT" "$HOST" "$ARGO_DOMAIN" "$ARGO_AUTH" >/dev/null; then
+               echo "远程部署命令已完成"
+             else
+               echo "远程部署命令失败"
+             fi
           else
             echo "🎉恭喜！✅检测到所有进程正常运行中 "
             SSH_USER_LOWER=$(echo "$SSH_USER" | tr '[:upper:]' '[:lower:]')
-            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST" "
+            serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" "
             echo \"配置显示如下：\"
             cat domains/${SSH_USER_LOWER}.serv00.net/logs/list.txt
             echo \"====================================================\""

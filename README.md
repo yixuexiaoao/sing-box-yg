@@ -62,7 +62,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/s
 
 ### 本仓库与原版的区别
 
-本仓库基于 [yonggekkk/sing-box-yg](https://github.com/yonggekkk/sing-box-yg) 修改（Serv00/Hostuno 脚本未改动），主要区别如下：
+本仓库基于 [yonggekkk/sing-box-yg](https://github.com/yonggekkk/sing-box-yg) 修改，主要区别如下：
 
 | 方面 | 原版 | 本仓库 |
 |---|---|---|
@@ -164,6 +164,8 @@ python3 /etc/s-box/sbagent.py coreupgrade 1.12.10               # 切换 sing-bo
 [Serv00免费代理脚本最终教程（五）：Github、VPS、软路由多平台脚本大更新！支持多功能网页，Cron内射保活+网页外射保活，任你选](https://youtu.be/tKaBdbU4G4s)
 
 ### Serv00/Hostuno-sb-yg一键脚本 
+
+使用 `kp.sh` 前，请将从服务商或可信渠道核验的 SSH 主机公钥加入运行账号的 `~/.ssh/known_hosts`。使用 `SSH.yml` 模板时，在 GitHub Actions Secrets 设置 `SSH_ACCOUNTS`（含 `SSH_USER`、`SSH_PASS` 和 `HOST` 的 JSON 数组）和 `SSH_KNOWN_HOSTS`（经核验的 `known_hosts` 内容）。主机密钥缺失或不匹配时，自动化会停在连接校验阶段。
 
 * Argo高度自定义：可以重置临时隧道; 可以继续使用上回的固定隧道; 也可以更换固定隧道的域名或token
 

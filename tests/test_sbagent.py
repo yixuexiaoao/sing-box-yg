@@ -182,6 +182,16 @@ conf = {"port": 0, "token": "tok-1234567890abcdef", "path": "/p", "listen": "127
 srv = A.make_server(conf); port = srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 keys = A.derive_keys(conf["token"])
+sample_doc = {"text": "x" * 1024}
+sample_envelope = A.seal(sample_doc, keys)
+check(sample_envelope["z"] == 1 and A.unseal(sample_envelope, keys, max_plaintext=2048) == sample_doc,
+      "normal compressed API data accepted within limit")
+try:
+    A.unseal(sample_envelope, keys, max_plaintext=512)
+    check(False, "decompressed API data limit enforced")
+except ValueError:
+    check(True, "decompressed API data limit enforced")
+
 def call(action, params=None, keys=keys):
     body = json.dumps(A.seal({"ts": time.time(), "nonce": os.urandom(8).hex(), "action": action, "params": params or {}}, keys)).encode()
     try:
@@ -313,6 +323,15 @@ for label, sb, ag in (("bad script", b"not a script", new_agent),
         check(open(AGENT, "rb").read() == before_agent and open(A.SB_SCRIPT, "rb").read() == b"#!/bin/bash\n# old\n",
               "upgrade rejects %s, nothing replaced" % label)
 files.update({"/sb.sh": good_sb, "/sbagent.py": new_agent, "/version": ver})
+has_command = A.has
+try:
+    A.has = lambda name: name != "bash" and has_command(name)
+    A.check_script(good_sb)
+    check(False, "upgrade requires Bash syntax validation")
+except RuntimeError as e:
+    check("Bash" in str(e), "upgrade requires Bash syntax validation")
+finally:
+    A.has = has_command
 r = A.do_upgrade()
 check(r["to"] == {"script": "v99.1", "agent": "9.9.9"} and open(A.SB_SCRIPT, "rb").read() == good_sb
       and open(AGENT, "rb").read() == new_agent and A.script_version() == "v99.1",
@@ -353,6 +372,14 @@ check(resp.startswith(b"HTTP/1.0 404"), "server serves again after held connecti
 srv2.shutdown()
 # ---------------- 8. 远程升级 sing-box 内核（需要可执行的假内核，仅在 Linux 上运行）
 check(A.ACTIONS["coreupgrade"][0] == "upgrade", "core upgrade needs the separate upgrade permission")
+check(all(A.core_version_allowed(v) for v in ("1.4.5", "1.5.0-rc.5", "1.10.7", "1.13.0-beta.1")),
+      "fixed and later core versions accepted")
+for affected in ("1.4.4", "1.4.5-rc.1", "1.5.0-beta.1", "1.5.0-rc.4"):
+    try:
+        A.do_core_upgrade({"version": affected})
+        check(False, "old core rejected: " + affected)
+    except ValueError as e:
+        check("CVE-2023-43644" in str(e), "old core blocked before download: " + affected)
 for bad in ("../../x", "1.2.3;id", "1.2", "latest2", "http://x/1.2.3"):
     try:
         A.do_core_upgrade({"version": bad})
@@ -400,7 +427,7 @@ if os.name != "nt" and A.core_arch():
         A.do_core_upgrade({"version": "9.8.1"}); check(False, "incompatible core rejected")
     except RuntimeError as e:
         check("check" in str(e) and open(A.SB_BIN, "rb").read() == old_bin, "core failing sing-box check is rejected, binary untouched")
-    fake_core("9.8.2", report="1.0.0")
+    fake_core("9.8.2", report="9.8.20")
     try:
         A.do_core_upgrade({"version": "9.8.2"}); check(False, "version mismatch rejected")
     except RuntimeError:
