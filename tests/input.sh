@@ -100,4 +100,11 @@ sbcloud(){ echo google; }; ufw(){ [[ $1 == status ]] && echo "Status: inactive";
 out=$(sbfwask tcp/443 udp/20003 2>&1)
 t "google cloud: tells to open VPC firewall with a ready gcloud command" "$(echo "$out" | grep -c 'VPC 防火墙')|$(echo "$out" | grep -cE '^gcloud compute firewall-rules create sing-box-yg-[0-9]+ .*--rules=tcp:443,udp:20003$')" "1|1"
 unset -f sbcloud ufw iptables ip6tables
+
+source <(sed -n '/^sbreleasenotes(){/,/^lapre(){/ { /^lapre(){/d; p; }' sb.sh)
+records=$'前言\r\nv26.11.20更新内容：\r\n最新记录\r\nv26.11.19更新内容：\r\n上一版本\r\nv26.11.4.4更新内容:\r\n补丁记录\r\nv26.11.4更新内容：\r\n旧记录\r\n'
+t "release notes show only newer versions" "$(sbreleasenotes v26.11.19 <<< "$records")" $'v26.11.20更新内容：\n最新记录'
+t "release notes compare numerical and fourth components" "$(sbreleasenotes v26.11.4 <<< "$records")" $'v26.11.20更新内容：\n最新记录\nv26.11.19更新内容：\n上一版本\nv26.11.4.4更新内容:\n补丁记录'
+t "release notes hidden when current is latest" "$(sbreleasenotes v26.11.20 <<< "$records")" ""
+t "release notes hidden when installed version is unknown" "$(sbreleasenotes unknown <<< "$records")" ""
 echo "FAILS: $fails"; exit $((fails > 0))

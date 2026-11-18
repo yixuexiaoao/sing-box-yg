@@ -4345,6 +4345,31 @@ curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1 > /e
 green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
 }
 
+sbreleasenotes(){
+awk -v installed="$1" '
+function newer(a, b, an, bn, x, y, i) {
+    an = split(substr(a, 2), x, /[.]/)
+    bn = split(substr(b, 2), y, /[.]/)
+    for (i = 1; i <= an || i <= bn; i++) {
+        if (x[i] + 0 != y[i] + 0) return (x[i] + 0) > (y[i] + 0)
+    }
+    return 0
+}
+BEGIN {
+    sub(/\r$/, "", installed)
+    if (installed !~ /^v[0-9]+([.][0-9]+)+$/) exit
+}
+{
+    sub(/\r$/, "")
+    if ($0 ~ /^v[0-9]+([.][0-9]+)+[[:blank:]]*更新内容(：|:)?[[:space:]]*$/) {
+        version = $0
+        sub(/[[:blank:]]*更新内容.*$/, "", version)
+        show = newer(version, installed)
+    }
+    if (show) print
+}'
+}
+
 lapre(){
 if [[ -n $1 && -s $1 ]]; then
 json=$(cat "$1")
@@ -5217,16 +5242,25 @@ white "-------------------------------------------------------------------------
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
+insV=${insV%$'\r'}
 wait $sbpp1 2>/dev/null
 verinfo=$(cat "$sbpre/ver" 2>/dev/null)
-latestV=$(echo "$verinfo" | awk -F "更新内容" '{print $1}' | head -n 1)
+latestV=$(printf '%s\n' "$verinfo" | awk 'NR == 1 { sub(/[[:space:]]*更新内容.*$/, ""); sub(/\r$/, ""); print; exit }')
+[[ $latestV =~ ^v[0-9]+(\.[0-9]+)+$ ]] || latestV=""
 if [ -f /etc/s-box/v ]; then
-if [ "$insV" = "$latestV" ]; then
+if [[ -n $latestV && $insV == "$latestV" ]]; then
 echo -e "当前 Sing-box-yg 脚本最新版：${bblue}${insV}${plain} (已安装)"
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${insV}${plain}"
+if [[ -z $latestV || ! $insV =~ ^v[0-9]+(\.[0-9]+)+$ ]]; then
+yellow "暂时无法比较已安装和远端脚本版本"
+else
+release_notes=$(printf '%s\n' "$verinfo" | sbreleasenotes "$insV")
+if [[ -n $release_notes ]]; then
 echo -e "检测到最新 Sing-box-yg 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
-echo -e "${yellow}${verinfo}${plain}"
+printf '%b%s%b\n' "$yellow" "$release_notes" "$plain"
+fi
+fi
 fi
 else
 echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${latestV}${plain}"
