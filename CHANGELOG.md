@@ -12,6 +12,7 @@
 
 - Bash 语法检查及内核、DNS、输入回归通过。Windows 本地环境跳过 DNS 符号链接用例和仅 Linux 执行的 Python 内核替换用例。
 - sbagent 95 项和 Worker 至 sbagent 的 154 项端到端测试全部通过。两份工作流的 YAML、嵌入 Bash 和本地模拟正常。未连接实际 Serv00 主机。
+- Linux 下载测试更新为提取完整的版本校验函数，并保留 GitHub 返回版本不存在时的验证。
 
 ### 使用说明
 
