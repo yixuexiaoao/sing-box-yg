@@ -38,7 +38,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -226,6 +226,36 @@ def _read_file(path):
         return f.read()
 
 
+def _log_tail(path, limit):
+    if path.endswith(".gz"):
+        # gzip 没有随机访问索引，逐块读取并只保留尾部所需的字节。
+        chunks = collections.deque()
+        size = 0
+        dropped = False
+        with gzip.open(path, "rb") as f:
+            for data in iter(lambda: f.read(min(65536, limit)), b""):
+                chunks.append(data)
+                size += len(data)
+                while size - len(chunks[0]) >= limit:
+                    size -= len(chunks.popleft())
+                    dropped = True
+        data = b"".join(chunks)
+        start = max(0, size - limit)
+        # 若曾移除整块，已经离开文件开头，即使余量正好等于 limit。
+        clipped = start > 0 or dropped
+        data = data[start:]
+    else:
+        with open(path, "rb") as f:
+            start = max(0, os.fstat(f.fileno()).st_size - limit)
+            f.seek(start)
+            data = f.read(limit)
+        clipped = start > 0
+    if clipped:
+        first = data.find(b"\n")
+        return data[first + 1:] if first >= 0 else b""
+    return data
+
+
 def read_log_data(max_bytes=LOG_BUDGET):
     """读取当前日志与归档（含 .gz）的尾部，返回 (按时间顺序的文本块列表, 当前文件已读到的完整行位置)。"""
     chunks = []
@@ -248,12 +278,9 @@ def read_log_data(max_bytes=LOG_BUDGET):
         if budget <= 0:
             break
         try:
-            data = _read_file(path)
+            data = _log_tail(path, budget)
         except (OSError, EOFError, zlib.error):
             continue
-        if len(data) > budget:
-            data = data[len(data) - budget:]
-            data = data[data.find(b"\n") + 1:]
         budget -= len(data)
         chunks.insert(0, data)
     return chunks, pos
@@ -387,8 +414,9 @@ class LogIndex(object):
             cur = _file_id(LOG_FILE)
             rot = tuple(_file_id(p) for p in log_archives())
             ident = cur[:2] if cur else None
-            if self.parser is None or ident != self.ident or rot != self.rot or (cur and cur[2] < self.pos):
-                chunks, self.pos = read_log_data()
+            delta = cur[2] - self.pos if cur else 0
+            if self.parser is None or ident != self.ident or rot != self.rot or delta < 0 or delta > LOG_BUDGET:
+                chunks, self.pos = read_log_data(LOG_BUDGET)
                 self.parser = LogParser()
                 for data in chunks:
                     self.parser.feed(data.decode("utf-8", "replace").splitlines())
@@ -396,7 +424,7 @@ class LogIndex(object):
             elif cur and cur[2] > self.pos:
                 with open(LOG_FILE, "rb") as f:
                     f.seek(self.pos)
-                    data = f.read(cur[2] - self.pos)
+                    data = f.read(delta)
                 cut = data.rfind(b"\n") + 1
                 if cut:
                     self.parser.feed(data[:cut].decode("utf-8", "replace").splitlines())
@@ -2107,17 +2135,17 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def read_body(self, n):
-        end = time.time() + self.BODY_DEADLINE
-        buf = b""
+        end = time.monotonic() + self.BODY_DEADLINE
+        buf = bytearray()
         while len(buf) < n:
-            left = end - time.time()
+            left = end - time.monotonic()
             if left <= 0:
                 raise TimeoutError("read body timeout")
             self.connection.settimeout(min(left, 10))
             chunk = self.rfile.read1(min(65536, n - len(buf)))
             if not chunk:
                 raise ConnectionError("short body")
-            buf += chunk
+            buf.extend(chunk)
         return buf
 
     def do_POST(self):

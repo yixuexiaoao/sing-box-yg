@@ -11,6 +11,21 @@ REL="$T/rel"; SBCORE_URL="file://$REL"
 # Windows（Git Bash）上的 curl 需要 Windows 路径
 command -v cygpath >/dev/null 2>&1 && SBCORE_URL="file:///$(cygpath -m "$REL")"
 SBCORE_QUIET=-sS
+
+# 手动更新脚本必须在通过下载和语法校验后才覆盖当前版本。
+source <(sed -n '/^sbupdate_script(){/,/^}/p' sb.sh)
+mkdir -p "$T/script"
+installed="$T/script/sb"
+printf '#!/bin/bash\necho old\n' > "$installed"
+sbupdate_script "$SBCORE_URL/missing.sh" "$installed" 2>/dev/null
+t 'manual update missing download preserves installed script' "$? $(bash "$installed")" '1 old'
+mkdir -p "$REL"
+printf '#!/bin/bash\nif then\n' > "$REL/bad.sh"
+sbupdate_script "$SBCORE_URL/bad.sh" "$installed" 2>/dev/null
+t 'manual update rejects invalid syntax without replacement' "$? $(bash "$installed")" '1 old'
+printf '#!/bin/bash\necho new\n' > "$REL/good.sh"
+sbupdate_script "$SBCORE_URL/good.sh" "$installed"
+t 'manual update replaces valid script' "$? $(bash "$installed")" '0 new'
 # 假内核：可执行脚本，输出与 sing-box 相同格式的版本信息
 mkpkg(){ # mkpkg 版本 [broken|norun|badcheck]
 local v=$1 n="sing-box-$1-linux-$cpu" chk=0

@@ -4314,14 +4314,19 @@ crontab "$sbcron" >/dev/null 2>&1
 : > "$sbcron"
 }
 
+sbupdate_script(){
+local url=$1 target=$2 tmp
+tmp=$(mktemp "${target%/*}/.sb.XXXXXX") || return 1
+if ! curl -fsSL --retry 2 -o "$tmp" "$url" || [[ $(head -n 1 "$tmp") != '#!/bin/bash' ]] ||
+   ! bash -n "$tmp" || ! chmod 755 "$tmp" || ! mv -f -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    return 1
+fi
+}
+
 lnsb(){
-rm -rf /usr/bin/sb
-curl -fL -o /usr/bin/sb -# --retry 2 ${sbrepo}/sb.sh
-chmod +x /usr/bin/sb
-local rc=$?
+sbupdate_script "${sbrepo}/sb.sh" /usr/bin/sb || return 1
 sbagentup
-# 返回 sb.sh 下载结果；调用方用 lnsb && ... 继续执行后续安装步骤
-return $rc
 }
 
 sbagentup(){
@@ -4340,8 +4345,13 @@ upsbyg(){
 if [[ ! -f '/usr/bin/sb' ]]; then
 red "未正常安装Sing-box-yg" && exit
 fi
-lnsb
-curl -sL ${sbrepo}/version | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
+local version_text target_version
+version_text=$(curl -fsSL --max-time 15 "${sbrepo}/version") || { red "读取发布版本失败，未更新脚本"; return 1; }
+target_version=${version_text%%$'\n'*}
+target_version=${target_version%%更新内容*}
+[[ $target_version =~ ^v[0-9]+(\.[0-9]+)+$ ]] || { red "发布版本格式错误，未更新脚本"; return 1; }
+lnsb || { red "更新脚本失败，请查看下载或校验错误"; return 1; }
+printf '%s\n' "$target_version" > /etc/s-box/v || { red "脚本已替换，记录版本失败"; return 1; }
 green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
 }
 

@@ -177,6 +177,26 @@ except ValueError:
 st = A.log_info()
 check(st["archives"] == 2 and st["policy"]["keep"] == 2, "log_info reports archives/policy")
 
+# 查询大归档和长时间未刷新的日志时，仍应只保留预算内的尾部记录。
+old_log, old_budget = A.LOG_FILE, A.LOG_BUDGET
+try:
+    A.LOG_FILE, A.LOG_BUDGET = os.path.join(T, "bounded.log"), 512
+    recent = line(87, now).encode()
+    with gzip.open(A.LOG_FILE + ".1.gz", "wb") as f:
+        f.write((b"old filler\n" * 6000) + recent)
+    chunks, _ = A.read_log_data(A.LOG_BUDGET)
+    check(sum(map(len, chunks)) <= A.LOG_BUDGET and b"".join(chunks).endswith(recent), "gzip query keeps a bounded tail")
+    os.remove(A.LOG_FILE + ".1.gz")
+    with open(A.LOG_FILE, "wb") as f:
+        f.write(line(86, now).encode())
+    idx = A.LogIndex()
+    check([r["dst"] for r in idx.records()] == ["h86.com:443"], "log index loaded before appending")
+    with open(A.LOG_FILE, "ab") as f:
+        f.write((b"old filler\n" * 1000) + recent)
+    check([r["dst"] for r in idx.records()] == ["h87.com:443"], "large append rebuilds log index within byte budget")
+finally:
+    A.LOG_FILE, A.LOG_BUDGET = old_log, old_budget
+
 # ---------------- 4. API permissions / whitelist / ban / reset interval / audit
 conf = {"port": 0, "token": "tok-1234567890abcdef", "path": "/p", "listen": "127.0.0.1", "perms": ["read"], "allow": []}
 srv = A.make_server(conf); port = srv.server_address[1]
