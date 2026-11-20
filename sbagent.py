@@ -11,6 +11,8 @@ import collections
 import ctypes
 import ctypes.util
 import datetime
+import errno
+import functools
 import gzip
 import hashlib
 import hmac
@@ -26,9 +28,11 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import parse_qs, urlsplit
 import uuid as uuidlib
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -38,7 +42,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -56,15 +60,78 @@ TRAFFIC_DB = os.path.join(SB_DIR, "sbtraffic.db")
 API_LOG = os.path.join(SB_DIR, "sbapi.log")
 CONF_NAMES = ("sb10.json", "sb11.json", "sb.json")
 LOG_MAX_MB = 10
-# 与 sb.sh 的 cronsb 写入的轮转任务相同（纯shell，不依赖python）
+# 旧纯 shell 行和新版兼容行都含有这个标记，关闭日志时可一并清除。
 ROTATE_MARK = "sing-box.log; [ -f $f ]"
-ROTATE_CRON = ("*/10 * * * * f=%s; [ -f $f ] && [ $(wc -c < $f) -gt %d ] && cp -f $f $f.1 && : > $f"
-               % (LOG_FILE, LOG_MAX_MB * 1024 * 1024))
+ROTATE_FALLBACK = ("f=%s; [ -f $f ] && [ $(wc -c < $f) -gt %d ] && cp -f $f $f.1 && : > $f"
+                   % (LOG_FILE, LOG_MAX_MB * 1024 * 1024))
+LEGACY_ROTATE_CRON = "*/10 * * * * " + ROTATE_FALLBACK
+ROTATE_CRON = ("*/10 * * * * if command -v python3 >/dev/null 2>&1 && [ -s /etc/s-box/sbagent.py ]; "
+               "then python3 /etc/s-box/sbagent.py rotate; else " + ROTATE_FALLBACK + "; fi")
 PROTO_NAMES = {"vless": "Vless-reality", "vmess": "Vmess-ws", "hysteria2": "Hysteria2",
                "tuic": "Tuic5", "anytls": "Anytls"}
 
 
 # ---------------------------------------------------------------- 工具函数
+class StateLock(object):
+    """同一进程可重入，并与其它 sbagent CLI/cron 进程互斥。"""
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.depth = 0
+        self.file = None
+
+    def __enter__(self):
+        self.lock.acquire()
+        try:
+            if not self.depth:
+                os.makedirs(SB_DIR, mode=0o700, exist_ok=True)
+                self.file = open(os.path.join(SB_DIR, ".sbagent.lock"), "a+b")
+                if os.name == "nt":
+                    import msvcrt
+                    if not os.path.getsize(self.file.name):
+                        self.file.write(b"\0")
+                        self.file.flush()
+                    self.file.seek(0)
+                    while True:
+                        try:
+                            msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError as e:
+                            if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                                raise
+                            time.sleep(0.05)
+                else:
+                    import fcntl
+                    fcntl.flock(self.file.fileno(), fcntl.LOCK_EX)
+            self.depth += 1
+            return self
+        except BaseException:
+            if self.file is not None:
+                self.file.close()
+                self.file = None
+            self.lock.release()
+            raise
+
+    def __exit__(self, *args):
+        self.depth -= 1
+        try:
+            if not self.depth:
+                self.file.close()  # 关闭句柄同时释放操作系统文件锁
+                self.file = None
+        finally:
+            self.lock.release()
+
+
+STATE_LOCK = StateLock()
+
+
+def serialized(fn):
+    @functools.wraps(fn)
+    def locked(*args, **kwargs):
+        with STATE_LOCK:
+            return fn(*args, **kwargs)
+    return locked
+
+
 def run(cmd, timeout=60, data=None, shell=False):
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -96,12 +163,16 @@ def read(path, default=""):
 
 
 def write(path, text, mode=None):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    if mode is not None:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def load_json(path, default=None):
@@ -614,6 +685,7 @@ def logging_enabled():
     return load_sbjson().get("log", {}).get("output") == LOG_FILE
 
 
+@serialized
 def set_logging(on):
     # 只改 "timestamp": true 这一行，保持 sb.sh 依赖的行号不变
     out_kv = ', "output": %s' % json.dumps(LOG_FILE)
@@ -637,6 +709,7 @@ def set_logging(on):
 LOG_POLICY_DEFAULT = {"max_mb": LOG_MAX_MB, "keep": 5, "compress": True, "retain_days": 30}
 
 
+@serialized
 def log_policy(p=None):
     """日志策略：单文件上限(MB)、保留归档份数、归档是否 gzip 压缩、归档保留天数(0=不限)。"""
     pol = dict(LOG_POLICY_DEFAULT)
@@ -682,6 +755,7 @@ def _enforce_archives(pol):
     return removed
 
 
+@serialized
 def rotate(max_mb=None):
     pol = log_policy()
     limit = (max_mb or pol["max_mb"]) * 1024 * 1024
@@ -696,6 +770,7 @@ def rotate(max_mb=None):
     return {"rotated": rotated, "removed": _enforce_archives(pol)}
 
 
+@serialized
 def clear_log():
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, "r+b") as f:
@@ -723,6 +798,7 @@ def parse_when(v, default=None):
     raise ValueError("时间格式错误：%s（应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM）" % v)
 
 
+@serialized
 def prune_log(p):
     """删除 [start, end) 时间段内的日志行（按服务器本地时间），涉及当前日志与全部归档。"""
     start = parse_when(p.get("start"), 0)
@@ -783,12 +859,21 @@ def cron_write(lines):
     run(["crontab", "-"], data=("\n".join(lines) + "\n").encode())
 
 
+@serialized
+def migrate_rotation_cron():
+    lines = cron_lines()
+    if LEGACY_ROTATE_CRON in lines:
+        cron_write([line for line in lines if line not in (LEGACY_ROTATE_CRON, ROTATE_CRON)] + [ROTATE_CRON])
+
+
+@serialized
 def cron_set(marker, line):
     lines = [l for l in cron_lines() if marker not in l]
     lines.append(line)
     cron_write(lines)
 
 
+@serialized
 def cron_del(marker):
     lines = cron_lines()
     keep = [l for l in lines if marker not in l]
@@ -824,11 +909,18 @@ def get_links(_p=None):
         subs += [{"name": "Clash/Mihomo订阅", "link": base + "/clmi.yaml"},
                  {"name": "Sing-box订阅", "link": base + "/sbox.json"},
                  {"name": "聚合节点订阅", "link": base + "/jhsub.txt"}]
+    read_token = read(os.path.join(SB_DIR, "gitlabreadtoken.txt")).strip()
+    push_token = read(os.path.join(SB_DIR, "gitlabtoken.txt")).strip()
     for name, fn in (("Gitlab Sing-box订阅", "sing_box_gitlab.txt"), ("Gitlab Mihomo订阅", "clash_meta_gitlab.txt"),
                      ("Gitlab 聚合订阅", "jh_sub_gitlab.txt")):
         v = read(os.path.join(SB_DIR, fn)).strip()
-        if v:
-            subs.append({"name": name, "link": v})
+        if v and read_token and read_token != push_token:
+            try:
+                url = urlsplit(v)
+                if url.scheme == "https" and url.netloc == "gitlab.com" and parse_qs(url.query).get("private_token") == [read_token]:
+                    subs.append({"name": name, "link": v})
+            except ValueError:
+                pass
     return {"links": links, "subs": subs, "rev": params_rev()}
 
 
@@ -906,6 +998,7 @@ def sb_check(path):
     return rc == 0, out
 
 
+@serialized
 def do_reset(items, regen=True):
     items = parse_items(items)
     paths = conf_paths()
@@ -1024,6 +1117,7 @@ def load_json_str(s):
 
 
 # ---------------------------------------------------------------- 定时重置 / 泄露检测
+@serialized
 def schedule(p):
     """定时自动重置：mode = off | daily | weekly，items 同 reset。"""
     mode = p.get("mode")
@@ -1041,6 +1135,7 @@ def schedule(p):
     return {"cron": cron_get(marker)}
 
 
+@serialized
 def leak_conf(p=None):
     conf = load_json(LEAK_CONF, None) or {"enabled": False, "threshold": 10, "hours": 24,
                                           "action": "notify", "items": "all"}
@@ -1109,6 +1204,7 @@ CLASH_RE = re.compile(r',\s*"experimental":\{"clash_api":\{[^{}]*\}\}')
 SHORT_HOST = "(短连接/未识别)"
 
 
+@serialized
 def traffic_conf(p=None):
     conf = load_json(CLASH_CONF, None) or {}
     conf.setdefault("retain_days", 90)
@@ -1126,6 +1222,7 @@ def traffic_enabled():
     return "clash_api" in (load_sbjson().get("experimental") or {})
 
 
+@serialized
 def set_traffic(on):
     if on and sqlite3 is None:
         raise RuntimeError("当前 python3 缺少 sqlite3 模块，无法启用流量统计")
@@ -1562,6 +1659,7 @@ def restart_detached(bdir):
     return True
 
 
+@serialized
 def do_upgrade(p=None):
     if not UPGRADE_LOCK.acquire(False):
         raise RuntimeError("已有升级正在进行")
@@ -1651,6 +1749,7 @@ def _core_installed():
     return v.splitlines()[0].replace("sing-box version ", "").strip() if v else ""
 
 
+@serialized
 def do_core_upgrade(p=None):
     p = p or {}
     want = str(p.get("version") or "latest").strip()
@@ -1940,7 +2039,7 @@ def params_rev():
         fid = _file_id(os.path.join(SB_DIR, fn))
         h.update(repr(fid[2:] if fid else None).encode())
     return h.hexdigest()[:16]
-MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog", "upgrade", "coreupgrade"}
+MUTATING = {"reset", "restart", "logon", "logoff", "trafficon", "trafficoff", "trafficpurge", "logprune", "clearlog", "upgrade", "coreupgrade", "logpolicy", "schedule", "leakconf", "trafficconf"}
 QUIET = {"ping", "status", "logs", "stats", "peers", "rawlog", "traffic", "apilog"}  # 高频只读动作不写审计日志
 
 
@@ -2015,7 +2114,6 @@ class Api(object):
         self.fails = {}
         self.banned = {}
         self.lock = threading.Lock()
-        self.reset_lock = threading.Lock()
 
     def permitted_ip(self, ip):
         """白名单与封禁检查，在读取请求体之前进行。"""
@@ -2089,7 +2187,7 @@ class Api(object):
             if need and need not in self.perms:
                 raise PermissionError("权限不足：此 Token 未授予 %s 权限（在 VPS 上运行 sb 选 19 修改）" % need)
             if action in MUTATING:
-                with self.reset_lock:
+                with STATE_LOCK:
                     if action == "reset":
                         last = last_reset()
                         left = self.reset_interval - (time.time() - time.mktime(
@@ -2101,6 +2199,7 @@ class Api(object):
                 data = fn(params)
             if action == "reset" and "links" not in self.perms and isinstance(data, dict):
                 data = {k: v for k, v in data.items() if k not in ("links", "subs")}
+                data["changed"] = {k: True for k in data.get("changed", {})}
             resp = {"ok": True, "data": data}
         except Exception as e:  # 业务错误加密返回给面板
             resp = {"ok": False, "error": str(e)}
@@ -2232,6 +2331,7 @@ def serve():
         os.chmod(SB_DIR, 0o700)  # 目录内有 Reality 私钥、API Token 等，禁止其他本地用户读取
     except OSError:
         pass
+    migrate_rotation_cron()
     LOG_INDEX = LogIndex()
     if sqlite3 is not None:
         COLLECTOR = TrafficCollector()
@@ -2279,6 +2379,7 @@ def parse_allow(v):
     return nets
 
 
+@serialized
 def api_init(port=None, regen=False, perms=None, allow=None, reset_interval=None):
     conf = load_json(API_CONF, None) or {}
     if port:

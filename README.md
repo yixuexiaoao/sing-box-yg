@@ -172,7 +172,7 @@ python3 /etc/s-box/sbagent.py coreupgrade 1.12.10               # 切换 sing-bo
 * Argo高度自定义：可以重置临时隧道; 可以继续使用上回的固定隧道; 也可以更换固定隧道的域名或token
 
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/serv00.sh)
 ```
 
 #### Serv00/Hostuno-sb-yg脚本界面预览图，仅限方案一的SSH端安装脚本（注：仅供围观）
@@ -189,3 +189,16 @@ bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/ser
 
 ---------------------------------------
 #### 声明：所有代码来源于Github社区与ChatGPT的整合
+
+
+### Serv00 管理网页与保活凭据
+
+Serv00 安装或更新会在账号家目录创建 `.sbyg-admin-token`，文件权限为 600。管理 `/up`、`/re`、`/rp` 使用 HTTPS POST，并在 `Authorization` 请求头中携带 `Bearer <该文件中的值>`。`/jc` 经相同认证后仅返回操作忙闲状态。SSH 安装和本机保活不输出管理 Token、节点配置或远程脚本输出。已有安装应更新本脚本并选择更新，确认 Node.js 网站已重启后再配置保活任务。
+
+GitHub 网页保活使用 secret `HTTP_TARGETS`，内容为 JSON 数组，例如 `[{"url":"https://管理域名/up","token":"64位十六进制管理Token"}]`。Worker 保活模板使用同名 secret。旧的匿名 URL 需要补充独立管理 Token。
+
+SSH 部署工作流 `serv00.yml` 使用 secret `SERV00_ACCOUNTS` 保存账号 JSON，`SSH.yml` 使用 `SSH_ACCOUNTS`。两者均需要 secret `SSH_KNOWN_HOSTS`，内容为通过服务商控制台等独立渠道核验的 OpenSSH known_hosts 条目。本地 `kp.sh` 从环境变量 `ACCOUNTS` 读取账号 JSON，并使用已经核验的 `~/.ssh/known_hosts`，主机密钥缺失或变更时连接失败。
+
+### GitLab 订阅凭据
+
+GitLab 推送令牌与订阅读取令牌分别配置。菜单要求独立的只读个人访问令牌包含 `read_api`，并通过 GitLab API 核验其 scope。只读令牌仅允许 `read_api`、`read_user`、`read_repository`。留空会停用 GitLab 订阅。旧订阅中包含推送令牌时停止输出该链接，请在菜单重新设置只读令牌，并撤销曾经分享的推送令牌。已经导入客户端的旧链接需更新。

@@ -1,23 +1,28 @@
 addEventListener('scheduled', event => event.waitUntil(handleScheduled()));
-// 配合甬哥的serv00的SSH脚本或者Github/VPS/软路由脚本，生成保活网页与重启网页
-// 每个保活/up网页或每个重启/re网页之间用空格或者，或者,间隔开，网页前带http://
-const urlString = 'http://保活或重启网页1 http://保活或重启网页2 http://保活或重启网页3 ………';
-const urls = urlString.split(/[\s,，]+/);
-const TIMEOUT = 5000;
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT);
-  try {
-    await fetch(url, { signal: controller.signal });
-    console.log(`✅ 成功: ${url}`);
-  } catch (error) {
-    console.warn(`❌ 访问失败: ${url}, 错误: ${error.message}`);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+// 在 Worker secret HTTP_TARGETS 中配置 JSON 数组，每项含 https URL 与独立管理 token。
 async function handleScheduled() {
-  console.log('⏳ 任务开始');
-  await Promise.all(urls.map(fetchWithTimeout));
-  console.log('📊 任务结束');
+  const targets = JSON.parse(HTTP_TARGETS);
+  if (!Array.isArray(targets) || !targets.length) throw new Error('HTTP_TARGETS 格式错误');
+  for (let index = 0; index < targets.length; index++) {
+    const { url, token } = targets[index];
+    if (typeof url !== 'string' || !/^https:\/\/[A-Za-z0-9.-]+\/(up|re)$/.test(url) ||
+        typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) {
+      throw new Error(`第 ${index + 1} 项配置错误`);
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 190000);
+    try {
+      const response = await fetch(url, {
+        method: 'POST', redirect: 'error', signal: controller.signal,
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) throw new Error('请求失败');
+      await response.body?.cancel();
+      console.log(`第 ${index + 1} 项操作完成`);
+    } catch {
+      throw new Error(`第 ${index + 1} 项操作失败`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }

@@ -3414,6 +3414,7 @@ fi
 }
 
 tgsbshow(){
+gitlabsafe
 echo
 yellow "1：重置/设置Telegram机器人的Token、用户ID"
 yellow "0：返回上层"
@@ -3537,6 +3538,7 @@ fi
 }
 
 tgnotice(){
+gitlabsafe
 if [[ -f /etc/s-box/sbtg.sh ]]; then
 green "请稍等5秒，TG机器人准备推送……"
 sbshare > /dev/null 2>&1
@@ -3701,6 +3703,19 @@ changeserv
 fi
 }
 
+gitlabsafe(){
+local push_token read_token f url
+push_token=$(cat /etc/s-box/gitlabtoken.txt 2>/dev/null)
+read_token=$(cat /etc/s-box/gitlabreadtoken.txt 2>/dev/null)
+for f in sing_box_gitlab.txt clash_meta_gitlab.txt jh_sub_gitlab.txt; do
+[[ -f /etc/s-box/$f ]] || continue
+url=$(cat "/etc/s-box/$f")
+if [[ -z $read_token || $read_token == "$push_token" || ${url##*&private_token=} != "$read_token" ]]; then
+rm -f "/etc/s-box/$f"
+fi
+done
+}
+
 gitlabsub(){
 echo
 green "请确保Gitlab官网上已建立项目，已开启推送功能，已获取访问令牌"
@@ -3710,7 +3725,21 @@ readp "请选择【0-1】：" menu
 if [ "$menu" = "1" ]; then
 cd /etc/s-box
 readp "输入登录邮箱: " email
-readp "输入访问令牌: " token
+readp "输入推送令牌（write_repository）: " token
+readp "输入独立只读个人访问令牌（仅 read_api，可留空停用Gitlab订阅）: " readtoken
+if [[ -n $readtoken ]]; then
+if [[ $readtoken == "$token" || ! $readtoken =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
+red "只读令牌格式错误，且必须与推送令牌不同"; return 1
+fi
+local token_info
+token_info=$(printf 'header = "PRIVATE-TOKEN: %s"\n' "$readtoken" | curl -fsS --max-time 15 --config - https://gitlab.com/api/v4/personal_access_tokens/self) || { red "无法核验只读令牌"; return 1; }
+if ! jq -e '.active == true and .revoked == false and (.scopes | length > 0) and ([.scopes[] | select(. != "read_api" and . != "read_user" and . != "read_repository")] | length == 0) and (.scopes | index("read_api") != null)' <<< "$token_info" >/dev/null; then
+red "订阅令牌需包含 read_api，且只能具有只读权限"; return 1
+fi
+fi
+printf '%s\n' "$readtoken" > /etc/s-box/gitlabreadtoken.txt
+chmod 600 /etc/s-box/gitlabreadtoken.txt
+rm -f /etc/s-box/{sing_box_gitlab,clash_meta_gitlab,jh_sub_gitlab}.txt
 readp "输入用户名: " userid
 readp "输入项目名: " project
 echo
@@ -3749,9 +3778,13 @@ interact
 EOF
 chmod +x gitpush.sh
 ./gitpush.sh "git push -f origin main${gitlab_ml}" cat /etc/s-box/gitlabtoken.txt >/dev/null 2>&1
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/sbox.json/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/sing_box_gitlab.txt
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/clmi.yaml/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/clash_meta_gitlab.txt
-echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/jhsub.txt/raw?ref=${git_sk}&private_token=${token}" > /etc/s-box/jh_sub_gitlab.txt
+if [[ -n $readtoken ]]; then
+echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/sbox.json/raw?ref=${git_sk}&private_token=${readtoken}" > /etc/s-box/sing_box_gitlab.txt
+echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/clmi.yaml/raw?ref=${git_sk}&private_token=${readtoken}" > /etc/s-box/clash_meta_gitlab.txt
+echo "https://gitlab.com/api/v4/projects/${userid}%2F${project}/repository/files/jhsub.txt/raw?ref=${git_sk}&private_token=${readtoken}" > /etc/s-box/jh_sub_gitlab.txt
+else
+yellow "未设置只读令牌，Gitlab订阅已停用"
+fi
 clsbshow
 else
 yellow "设置Gitlab订阅链接失败，请反馈"
@@ -3763,6 +3796,7 @@ fi
 }
 
 gitlabsubgo(){
+gitlabsafe
 cd /etc/s-box
 if [[ $(ls -a | grep '^\.git$') ]]; then
 if [ -f /etc/s-box/gitlab_ml_ml ]; then
@@ -3782,6 +3816,7 @@ cd
 }
 
 clsbshow(){
+gitlabsafe
 green "当前Sing-box节点已更新并推送"
 green "Sing-box订阅链接如下："
 blue "$(cat /etc/s-box/sing_box_gitlab.txt 2>/dev/null)"
@@ -4299,7 +4334,7 @@ cronsb(){
 uncronsb
 crontab -l 2>/dev/null > "$sbcron"
 echo "0 1 * * * systemctl restart sing-box;rc-service sing-box restart" >> "$sbcron"
-echo '*/10 * * * * f=/etc/s-box/sing-box.log; [ -f $f ] && [ $(wc -c < $f) -gt 10485760 ] && cp -f $f $f.1 && : > $f' >> "$sbcron"
+echo '*/10 * * * * if command -v python3 >/dev/null 2>&1 && [ -s /etc/s-box/sbagent.py ]; then python3 /etc/s-box/sbagent.py rotate; else f=/etc/s-box/sing-box.log; [ -f $f ] && [ $(wc -c < $f) -gt 10485760 ] && cp -f $f $f.1 && : > $f; fi' >> "$sbcron"
 crontab "$sbcron" >/dev/null 2>&1
 : > "$sbcron"
 }
@@ -4317,7 +4352,7 @@ crontab "$sbcron" >/dev/null 2>&1
 sbupdate_script(){
 local url=$1 target=$2 tmp
 tmp=$(mktemp "${target%/*}/.sb.XXXXXX") || return 1
-if ! curl -fsSL --retry 2 -o "$tmp" "$url" || [[ $(head -n 1 "$tmp") != '#!/bin/bash' ]] ||
+if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 -o "$tmp" "$url" || [[ $(head -n 1 "$tmp") != '#!/bin/bash' ]] ||
    ! bash -n "$tmp" || ! chmod 755 "$tmp" || ! mv -f -- "$tmp" "$target"; then
     rm -f -- "$tmp"
     return 1
@@ -4325,21 +4360,79 @@ fi
 }
 
 lnsb(){
-sbupdate_script "${sbrepo}/sb.sh" /usr/bin/sb || return 1
-sbagentup
+(
+local script_stage agent_stage='' script_backup='' agent_backup=''
+local script_published=0 agent_published=0 committed=0 restart_failed=0
+script_stage=$(mktemp /usr/bin/.sb-stage.XXXXXX) || exit 1
+trap '
+if [[ $committed == 0 ]]; then
+if [[ $script_published == 1 ]]; then
+if [[ -n $script_backup ]]; then mv -f -- "$script_backup" /usr/bin/sb || red "恢复脚本失败，备份保存在 $script_backup"; else rm -f /usr/bin/sb; fi
+else rm -f -- "$script_backup"; fi
+if [[ $agent_published == 1 ]]; then
+if [[ -n $agent_backup ]]; then mv -f -- "$agent_backup" /etc/s-box/sbagent.py || red "恢复代理失败，备份保存在 $agent_backup"; else rm -f /etc/s-box/sbagent.py; fi
+else rm -f -- "$agent_backup"; fi
+[[ $restart_failed == 0 ]] || sbagentrestart force || red "旧代理重启失败，请检查服务日志"
+else
+rm -f -- "$script_backup" "$agent_backup"
+fi
+rm -f -- "$script_stage" "$agent_stage"
+' EXIT
+sbupdate_script "${sbrepo}/sb.sh" "$script_stage" || exit 1
+if [[ -d /etc/s-box ]]; then
+agent_stage=$(mktemp /etc/s-box/.sbagent-stage.XXXXXX) || exit 1
+sbupdate_agent "${sbrepo}/sbagent.py" "$agent_stage" || exit 1
+fi
+if [[ -e /usr/bin/sb ]]; then
+script_backup=$(mktemp /usr/bin/.sb-backup.XXXXXX) || exit 1
+cp -p -- /usr/bin/sb "$script_backup" || exit 1
+fi
+if [[ -n $agent_stage ]]; then
+if [[ -e /etc/s-box/sbagent.py ]]; then
+agent_backup=$(mktemp /etc/s-box/.sbagent-backup.XXXXXX) || exit 1
+cp -p -- /etc/s-box/sbagent.py "$agent_backup" || exit 1
+fi
+mv -f -- "$agent_stage" /etc/s-box/sbagent.py || exit 1
+agent_published=1
+fi
+mv -f -- "$script_stage" /usr/bin/sb || exit 1
+script_published=1
+if [[ $agent_published == 1 ]] && ! sbagentrestart; then
+restart_failed=1
+exit 1
+fi
+committed=1
+)
 }
 
-sbagentup(){
-[[ -d /etc/s-box ]] || return 0
-curl -sL -o /etc/s-box/sbagent.py.tmp --retry 2 ${sbrepo}/sbagent.py && grep -q 'sbagent' /etc/s-box/sbagent.py.tmp && mv -f /etc/s-box/sbagent.py.tmp /etc/s-box/sbagent.py
-rm -f /etc/s-box/sbagent.py.tmp
+sbupdate_agent(){
+local url=$1 target=$2 tmp
+command -v python3 >/dev/null 2>&1 || return 1
+tmp=$(mktemp "${target%/*}/.sbagent.XXXXXX") || return 1
+if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 -o "$tmp" "$url" ||
+   ! python3 -c 'import ast, pathlib, sys
+module = ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert any(isinstance(node, ast.FunctionDef) and node.name == "main" for node in module.body)
+assert any(isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets) for node in module.body)' "$tmp" >/dev/null 2>&1 ||
+   ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$target"; then
+rm -f -- "$tmp"
+return 1
+fi
+}
+
+sbagentrestart(){
 if command -v apk >/dev/null 2>&1; then
-if rc-service sbagent status >/dev/null 2>&1; then rc-service sbagent restart >/dev/null 2>&1; fi
+if [[ ${1:-} == force ]] || rc-service sbagent status >/dev/null 2>&1; then
+rc-service sbagent restart >/dev/null 2>&1 || return 1
+fi
 else
-if systemctl is-active sbagent >/dev/null 2>&1; then systemctl restart sbagent >/dev/null 2>&1; fi
+if [[ ${1:-} == force ]] || systemctl is-active sbagent >/dev/null 2>&1; then
+systemctl restart sbagent >/dev/null 2>&1 || return 1
+fi
 fi
 return 0
 }
+
 
 upsbyg(){
 if [[ ! -f '/usr/bin/sb' ]]; then
@@ -4506,6 +4599,7 @@ fi
 }
 
 sbshare(){
+gitlabsafe
 rm -rf /etc/s-box/{jhdy,vl_reality,vm_ws_argols,vm_ws_argogd,vm_ws,vm_ws_tls,hy2,tuic5,an}.txt
 result_vl_vm_hy_tu && resvless && resvmess && reshy2 && restu5
 if [[ "$sbnh" != "1.10" ]]; then
@@ -4872,8 +4966,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 red "python3安装失败，无法使用该功能" && return 1
 fi
 if [[ ! -s /etc/s-box/sbagent.py ]]; then
-curl -sL -o /etc/s-box/sbagent.py.tmp --retry 2 ${sbrepo}/sbagent.py && grep -q 'sbagent' /etc/s-box/sbagent.py.tmp && mv -f /etc/s-box/sbagent.py.tmp /etc/s-box/sbagent.py
-rm -f /etc/s-box/sbagent.py.tmp
+sbupdate_agent "${sbrepo}/sbagent.py" /etc/s-box/sbagent.py || { red "API代理下载或校验失败，原文件已保留"; return 1; }
 fi
 if [[ ! -s /etc/s-box/sbagent.py ]]; then
 red "sbagent.py下载失败，请检查VPS能否访问Github" && return 1

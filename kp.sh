@@ -7,10 +7,9 @@
 # 必填变量：RES、REP、SSH_USER、SSH_PASS、HOST
 # 注意[]"",:这些符号不要乱删，按规律对齐
 # 每行一个{serv00服务器}，一个服务也可，末尾用,间隔，最后一个服务器末尾无需用,间隔
-ACCOUNTS='[
-{"RES":"n", "REP":"n", "SSH_USER":"你的serv00账号名", "SSH_PASS":"你的serv00账号密码", "REALITY":"你serv00账号名.serv00.net", "SUUID":"自设UUID", "TCP1_PORT":"vless的tcp端口", "TCP2_PORT":"vmess的tcp端口", "UDP_PORT":"hy2的udp端口", "HOST":"s1.serv00.com", "ARGO_DOMAIN":"", "ARGO_AUTH":""},
-{"RES":"y", "REP":"y", "SSH_USER":"123456", "SSH_PASS":"7890000", "REALITY":"time.is", "SUUID":"73203ee6-b3fa-4a3d-b5df-6bb2f55073ad", "TCP1_PORT":"", "TCP2_PORT":"", "UDP_PORT":"", "HOST":"s16.serv00.com", "ARGO_DOMAIN":"你的argo固定域名", "ARGO_AUTH":"eyJhIjoiOTM3YzFjYWI88552NTFiYTM4ZTY0ZDQzRmlNelF0TkRBd1pUQTRNVEJqTUdVeCJ9"}
-]'
+# 账号 JSON 通过环境变量 ACCOUNTS 提供，主机密钥须事先核验并保存至 ~/.ssh/known_hosts。
+: "${ACCOUNTS:?请通过环境变量提供账号 JSON}"
+
 serv00_ssh(){
     local user=$1 host=$2 password=$3
     shift 3
@@ -43,10 +42,11 @@ local ARGO_AUTH=${12}
 keep_script=$(mktemp) || exit 1
 trap 'rm -f "$keep_script"' EXIT
 curl --disable --proto '=https' --proto-redir '=https' -fsSL -o "$keep_script" \
-  https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00keep.sh && bash "$keep_script"
+  https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/serv00keep.sh && bash "$keep_script"
 REMOTE
   } | serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" bash -s
 }
+if ! command -v sshpass >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
 if  cat /etc/issue /proc/version /etc/os-release 2>/dev/null | grep -q -E -i "openwrt"; then
 opkg update
 opkg install sshpass curl jq
@@ -61,7 +61,8 @@ else
     elif [ -f /etc/alpine-release ]; then
         package_manager="apk add"
     fi
-    $package_manager sshpass curl jq cron >/dev/null 2>&1 &
+    $package_manager sshpass curl jq cron >/dev/null 2>&1 || exit 1
+fi
 fi
 echo "*****************************************************"
 echo "*****************************************************"
@@ -72,48 +73,50 @@ echo "自动远程部署Serv00三合一协议脚本【VPS+软路由】"
 echo "版本：V25.3.26"
 echo "*****************************************************"
 echo "*****************************************************"
-              count=0  
-           for account in $(echo "${ACCOUNTS}" | jq -c '.[]'); do
+              failures=0
+              count=0
+           accounts=$(jq -ce 'if type == "array" and length > 0 then .[] else error("invalid accounts") end' <<< "$ACCOUNTS") || exit 1
+           while IFS= read -r account; do
               count=$((count+1))
-              RES=$(echo $account | jq -r '.RES')
-              REP=$(echo $account | jq -r '.REP')              
-              SSH_USER=$(echo $account | jq -r '.SSH_USER')
-              SSH_PASS=$(echo $account | jq -r '.SSH_PASS')
-              REALITY=$(echo $account | jq -r '.REALITY')
-              SUUID=$(echo $account | jq -r '.SUUID')
-              TCP1_PORT=$(echo $account | jq -r '.TCP1_PORT')
-              TCP2_PORT=$(echo $account | jq -r '.TCP2_PORT')
-              UDP_PORT=$(echo $account | jq -r '.UDP_PORT')
-              HOST=$(echo $account | jq -r '.HOST')
-              ARGO_DOMAIN=$(echo $account | jq -r '.ARGO_DOMAIN')
-              ARGO_AUTH=$(echo $account | jq -r '.ARGO_AUTH') 
-          if serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" exit; then
-            echo "🎉恭喜！✅第【$count】台服务器连接成功！🚀服务器地址：$HOST ，账户名：$SSH_USER"   
+              RES=$(echo "$account" | jq -r '.RES')
+              REP=$(echo "$account" | jq -r '.REP')
+              SSH_USER=$(echo "$account" | jq -r '.SSH_USER')
+              SSH_PASS=$(echo "$account" | jq -r '.SSH_PASS')
+              REALITY=$(echo "$account" | jq -r '.REALITY')
+              SUUID=$(echo "$account" | jq -r '.SUUID')
+              TCP1_PORT=$(echo "$account" | jq -r '.TCP1_PORT')
+              TCP2_PORT=$(echo "$account" | jq -r '.TCP2_PORT')
+              UDP_PORT=$(echo "$account" | jq -r '.UDP_PORT')
+              HOST=$(echo "$account" | jq -r '.HOST')
+              ARGO_DOMAIN=$(echo "$account" | jq -r '.ARGO_DOMAIN')
+              ARGO_AUTH=$(echo "$account" | jq -r '.ARGO_AUTH')
+          if serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" exit 2>/dev/null; then
+            echo "第 $count 台服务器连接成功"
           if [ -z "${ARGO_DOMAIN}" ]; then
            printf -v check_process "ps aux | grep '[c]onfig' > /dev/null && ps aux | grep -- %q > /dev/null" "[l]ocalhost:$TCP2_PORT"
             else
            printf -v check_process "ps aux | grep '[c]onfig' > /dev/null && ps aux | grep -- %q > /dev/null" "[t]oken $ARGO_AUTH"
            fi
-          if ! serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" "$check_process" || [[ "$RES" =~ ^[Yy]$ ]]; then
+          if ! serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" "$check_process" 2>/dev/null || [[ "$RES" =~ ^[Yy]$ ]]; then
             echo "⚠️检测到主进程或者argo进程未启动，或者执行重置"
              echo "⚠️现在开始修复或重置部署……请稍等"
-             if run_remote_command "$RES" "$REP" "$SSH_USER" "$SSH_PASS" "$REALITY" "$SUUID" "$TCP1_PORT" "$TCP2_PORT" "$UDP_PORT" "$HOST" "$ARGO_DOMAIN" "$ARGO_AUTH" >/dev/null; then
+             if run_remote_command "$RES" "$REP" "$SSH_USER" "$SSH_PASS" "$REALITY" "$SUUID" "$TCP1_PORT" "$TCP2_PORT" "$UDP_PORT" "$HOST" "$ARGO_DOMAIN" "$ARGO_AUTH" >/dev/null 2>&1; then
                echo "远程部署命令已完成"
              else
                echo "远程部署命令失败"
+               failures=$((failures+1))
              fi
           else
             echo "🎉恭喜！✅检测到所有进程正常运行中 "
-            SSH_USER_LOWER=$(echo "$SSH_USER" | tr '[:upper:]' '[:lower:]')
-            serv00_ssh "$SSH_USER" "$HOST" "$SSH_PASS" "
-            echo \"配置显示如下：\"
-            cat domains/${SSH_USER_LOWER}.serv00.net/logs/list.txt
-            echo \"====================================================\""
+
             fi
            else
             echo "===================================================="
-            echo "💥杯具！❌第【$count】台服务器连接失败！🚀服务器地址：$HOST ，账户名：$SSH_USER"
-            echo "⚠️可能账号名、密码、服务器名称输入错误，或者当前服务器在维护中"  
+            echo "第 $count 台服务器连接失败"
+            failures=$((failures+1))
+            echo "⚠️可能账号名、密码、服务器名称输入错误，或者当前服务器在维护中"
             echo "===================================================="
            fi
-            done
+            done <<< "$accounts"
+
+exit $((failures > 0))

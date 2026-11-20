@@ -240,6 +240,7 @@ srv.api.reset_interval = 0
 srv.api.perms = {"read", "manage"}
 c, r = call("reset", {"items": "reality"})
 check(c == 200 and r["ok"] and "links" not in r["data"] and "changed" in r["data"], "reset result hides links without links perm")
+check(r["data"]["changed"] == {"reality": True}, "reset without links permission reports changed fields without values")
 srv.api.perms = {"read", "links", "manage"}
 log = A.api_log_read({"lines": 50})["entries"]
 check(any(e["action"] == "links" and not e["ok"] for e in log) and any(e["action"] == "trafficpurge" for e in log)
@@ -518,6 +519,69 @@ except Exception:
     _slow = True
 check(_slow and time.time() - _t0 < 5, "slow request body is cut off by the total deadline")
 _a.close(); _b.close()
+# ---------------- 并发配置、cron 与日志操作使用同一可重入锁
+_cron_state = []
+_cron_read, _cron_write = A.cron_lines, A.cron_write
+
+def _read_cron():
+    time.sleep(0.002)
+    return list(_cron_state)
+
+def _write_cron(lines):
+    _cron_state[:] = lines
+
+A.cron_lines, A.cron_write = _read_cron, _write_cron
+_workers = [threading.Thread(target=A.cron_set, args=("test-job-%d " % i, "test-job-%d command" % i)) for i in range(12)]
+for _worker in _workers:
+    _worker.start()
+for _worker in _workers:
+    _worker.join()
+check(len(_cron_state) == 12, "concurrent cron updates preserve all jobs")
+_cron_state[:] = ["unrelated job", A.LEGACY_ROTATE_CRON]
+A.migrate_rotation_cron()
+A.migrate_rotation_cron()
+check(_cron_state == ["unrelated job", A.ROTATE_CRON] and "sbagent.py rotate" in A.ROTATE_CRON,
+      "legacy rotation job migrates once and preserves other cron jobs")
+A.cron_del(A.ROTATE_MARK)
+check(_cron_state == ["unrelated job"], "logging disable removes the migrated rotation job")
+A.cron_lines, A.cron_write = _cron_read, _cron_write
+
+_errors = []
+with open(L, "a") as _log:
+    _log.write("rotation regression\n" * 70000)
+
+def _rotate_log():
+    try:
+        A.rotate()
+    except Exception as e:
+        _errors.append(str(e))
+
+_workers = [threading.Thread(target=_rotate_log) for _ in range(6)]
+for _worker in _workers:
+    _worker.start()
+for _worker in _workers:
+    _worker.join()
+check(not _errors, "concurrent log rotations finish without archive conflicts")
+
+_child_code = ("import runpy,sys; a=runpy.run_path(sys.argv[1]); "
+               "print('ready', flush=True); a['log_policy']({'retain_days': 17})")
+with A.STATE_LOCK:
+    with A.STATE_LOCK:
+        check(A.STATE_LOCK.depth == 2, "state lock is reentrant for nested configuration operations")
+    _child = _sp.Popen([sys.executable, "-X", "utf8", "-c", _child_code, AGENT], stdout=_sp.PIPE, stderr=_sp.PIPE)
+    _ready = _child.stdout.readline()
+    time.sleep(0.1)
+    check(_ready.strip() == b"ready" and _child.poll() is None, "CLI configuration waits while another process holds the state lock")
+_out, _err = _child.communicate(timeout=15)
+check(_child.returncode == 0 and A.log_policy()["retain_days"] == 17,
+      "CLI configuration completes after cross-process lock release: " + _err.decode("utf-8", "replace")[:200])
+_gitlab_link = "https://gitlab.com/api/v4/projects/test/repository/files/sbox.json/raw?ref=main&private_token=read-only-test"
+A.write(os.path.join(SB, "gitlabtoken.txt"), "push-only-test")
+A.write(os.path.join(SB, "gitlabreadtoken.txt"), "read-only-test")
+A.write(os.path.join(SB, "sing_box_gitlab.txt"), _gitlab_link)
+check(any(s["link"] == _gitlab_link for s in A.get_links()["subs"]), "GitLab subscription uses the configured separate read token")
+A.write(os.path.join(SB, "gitlabreadtoken.txt"), "")
+check(not any(s["name"].startswith("Gitlab") for s in A.get_links()["subs"]), "GitLab subscription requires a configured read token")
 os.remove(A.API_CONF)
 shutil.rmtree(T, ignore_errors=True)
 print("FAILS:", fails); sys.exit(1 if fails else 0)

@@ -1,4 +1,42 @@
 #!/bin/bash
+SBYG_SOURCE=${SBYG_SOURCE:-https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main}
+servwebcall(){
+[[ -s "$HOME/.sbyg-admin-token" ]] || return 0
+printf 'header = "Authorization: Bearer %s"\n' "$(cat "$HOME/.sbyg-admin-token")" | curl -fsS --max-time 10 --config - -X POST "https://${snb}.${USERNAME}.serv00.net/up" >/dev/null 2>&1
+}
+servwebinstall(){
+local adminfile="$HOME/.sbyg-admin-token" tmp had_app=0
+if [[ ! -s "$adminfile" ]]; then
+(umask 077; openssl rand -hex 32 > "$adminfile") || return 1
+fi
+chmod 600 "$adminfile" || return 1
+cat > "$HOME/webrestart.sh" <<'RESTART'
+#!/bin/bash
+set -e
+name=$(whoami | tr '[:upper:]' '[:lower:]')
+cd "$HOME/domains/$name.serv00.net/logs"
+pkill -f 'run -c con' || true
+binary=$(cat sb.txt)
+[[ $binary =~ ^[A-Za-z0-9_-]+$ ]] || exit 1
+nohup "./$binary" run -c config.json >/dev/null 2>&1 &
+RESTART
+chmod 700 "$HOME/webrestart.sh"
+tmp=$(mktemp "$keep_path/.app.XXXXXXXX") || return 1
+if curl -fsSL --max-time 30 "$SBYG_SOURCE/app.js" -o "$tmp" && /usr/local/bin/node18 --check < "$tmp" >/dev/null 2>&1; then
+if cmp -s "$tmp" "$keep_path/app.js"; then
+rm -f "$tmp"
+return 0
+fi
+[[ -f "$keep_path/app.js" ]] && had_app=1
+mv -f "$tmp" "$keep_path/app.js" || return 1
+if [[ $had_app == 1 ]]; then
+devil www restart "${snb}.${USERNAME}.serv00.net" >/dev/null 2>&1 || return 1
+fi
+else
+rm -f "$tmp"
+return 1
+fi
+}
 re="\033[0m"
 red="\033[1;91m"
 green="\e[1;32m"
@@ -27,7 +65,7 @@ FILE_PATH="${HOME}/domains/${USERNAME}.${address}/public_html"
 [ -d "$FILE_PATH" ] || mkdir -p "$FILE_PATH"
 [ -d "$WORKDIR" ] || (mkdir -p "$WORKDIR" && chmod 700 "$WORKDIR")
 devil binexec on >/dev/null 2>&1
-curl -sk "http://${snb}.${USERNAME}.${hona}.net/up" > /dev/null 2>&1
+servwebcall || true
 
 read_ip() {
 cat ip.txt
@@ -244,7 +282,7 @@ uninstall_singbox() {
           source ~/.bashrc
           purple "************************************************************"
           purple "Serv00/Hostuno-sb-yg卸载完成！"
-          purple "欢迎继续使用脚本：bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00.sh)"
+          purple "欢迎继续使用脚本：bash <(curl -Ls ${SBYG_SOURCE}/serv00.sh)"
           purple "************************************************************"
           ;;
         [Nn]) exit 0 ;;
@@ -262,10 +300,9 @@ reading "\n注意！！！清理所有进程并清空所有安装内容，将退
     source ~/.bashrc
     purple "************************************************************"
     purple "Serv00/Hostuno-sb-yg清理重置完成！"
-    purple "欢迎继续使用脚本：bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00.sh)"
+    purple "欢迎继续使用脚本：bash <(curl -Ls ${SBYG_SOURCE}/serv00.sh)"
     purple "************************************************************"
-    find ~ -type f -exec chmod 644 {} \; 2>/dev/null
-    find ~ -type d -exec chmod 755 {} \; 2>/dev/null
+    find ~ -type d -exec chmod u+rwx {} \; 2>/dev/null
     find ~ -type f -exec rm -f {} \; 2>/dev/null
     find ~ -type d -empty -exec rmdir {} \; 2>/dev/null
     find ~ -exec rm -rf {} \; 2>/dev/null
@@ -1363,8 +1400,8 @@ cd "$keep_path"
 npm install basic-auth express dotenv axios --silent > /dev/null 2>&1
 rm $HOME/domains/${snb}.${USERNAME}.${hona}.net/public_nodejs/public/index.html > /dev/null 2>&1
 devil www restart ${snb}.${USERNAME}.${hona}.net
-curl -sk "http://${snb}.${USERNAME}.${hona}.net/up" > /dev/null 2>&1
-green "安装完毕，多功能主页地址：http://${snb}.${USERNAME}.${hona}.net" && sleep 2
+servwebcall || true
+green "安装完毕，多功能主页地址：https://${snb}.${USERNAME}.${hona}.net" && sleep 2
 }
 
 okip(){
@@ -1393,7 +1430,7 @@ if [[ -e $WORKDIR/config.json ]]; then
   COMMAND="sb"
   SCRIPT_PATH="$HOME/bin/$COMMAND"
   mkdir -p "$HOME/bin"
-  curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00.sh > "$SCRIPT_PATH"
+  curl -Ls ${SBYG_SOURCE}/serv00.sh > "$SCRIPT_PATH"
   chmod +x "$SCRIPT_PATH"
 if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
     echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
@@ -1401,15 +1438,11 @@ if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
     source ~/.bashrc
 fi
 if [ "$hona" = "serv00" ]; then
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/app.js -o "$keep_path"/app.js
-sed -i '' "15s/name/$snb/g" "$keep_path"/app.js
-sed -i '' "59s/key/$UUID/g" "$keep_path"/app.js
-sed -i '' "90s/name/$USERNAME/g" "$keep_path"/app.js
-sed -i '' "90s/where/$snb/g" "$keep_path"/app.js
-curl -sSL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00keep.sh -o serv00keep.sh && chmod +x serv00keep.sh
+servwebinstall || { red "管理网页更新失败"; exit 1; }
+curl -sSL ${SBYG_SOURCE}/serv00keep.sh -o serv00keep.sh && chmod +x serv00keep.sh
 fi
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/index.html -o "$FILE_PATH"/index.html
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sversion | awk -F "更新内容" '{print $1}' | head -n 1 > $WORKDIR/v
+curl -sL ${SBYG_SOURCE}/index.html -o "$FILE_PATH"/index.html
+curl -sL ${SBYG_SOURCE}/sversion | awk -F "更新内容" '{print $1}' | head -n 1 > $WORKDIR/v
 else
 red "未安装脚本，请选择1进行安装" && exit
 fi
@@ -1421,7 +1454,7 @@ yellow "重启中……请稍后……"
 cd $WORKDIR
 ps aux | grep '[r]un -c con' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
 if [ "$hona" = "serv00" ]; then
-curl -sk "http://${snb}.${USERNAME}.${hona}.net/up" > /dev/null 2>&1
+bash "$HOME/webrestart.sh"
 sleep 5
 else
 sbb=$(cat sb.txt)
@@ -1573,14 +1606,14 @@ yellow "未设置端口"
 fi
 echo
 insV=$(cat $WORKDIR/v 2>/dev/null)
-latestV=$(curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sversion | awk -F "更新内容" '{print $1}' | head -n 1)
+latestV=$(curl -sL ${SBYG_SOURCE}/sversion | awk -F "更新内容" '{print $1}' | head -n 1)
 if [ -f $WORKDIR/v ]; then
 if [ "$insV" = "$latestV" ]; then
 echo -e "当前 Serv00/Hostuno-sb-yg 脚本最新版：${purple}${insV}${re} (已安装)"
 else
 echo -e "当前 Serv00/Hostuno-sb-yg 脚本版本号：${purple}${insV}${re}"
 echo -e "检测到最新 Serv00/Hostuno-sb-yg 脚本版本号：${yellow}${latestV}${re} (可选择5进行更新)"
-echo -e "${yellow}$(curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sversion)${re}"
+echo -e "${yellow}$(curl -sL ${SBYG_SOURCE}/sversion)${re}"
 fi
 echo -e "========================================================="
 sbb=$(cat $WORKDIR/sb.txt 2>/dev/null)
@@ -1608,7 +1641,7 @@ green "Argo固定域名：$argogd $check"
 fi
 if [ "$hona" = "serv00" ]; then
 green "多功能主页如下 (支持保活、重启、重置端口、进程查看、节点查询)"
-purple "http://${snb}.${USERNAME}.${hona}.net"
+purple "https://${snb}.${USERNAME}.${hona}.net"
 fi
 else
 echo -e "当前 Serv00/Hostuno-sb-yg 脚本版本号：${purple}${latestV}${re}"

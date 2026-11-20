@@ -8,6 +8,10 @@ on:
       - sb.sh
       - sbagent.py
       - tests/**
+      - app.js
+      - serv00.sh
+      - serv00keep.sh
+      - kp.sh
       - .github/workflows/config-check.yml
   workflow_dispatch:
   schedule:
@@ -183,6 +187,10 @@ jobs:
         run: bash tests/input.sh
       - name: sbagent unit tests
         run: python3 tests/test_sbagent.py
+      - name: Serv00 management and isolated upgrade checks
+        run: |
+          node tests/serv00.cjs
+          bash tests/management.sh
       - name: system DNS (NAT64) logic
         run: bash tests/dns.sh
       - name: core download / verify / replace (local archives)

@@ -21,6 +21,44 @@ export IP=${IP:-''}
 export reym=${reym:-''}
 export reset=${reset:-''}
 export resport=${resport:-''}
+SBYG_SOURCE=${SBYG_SOURCE:-https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main}
+servwebcall(){
+[[ -s "$HOME/.sbyg-admin-token" ]] || return 0
+printf 'header = "Authorization: Bearer %s"\n' "$(cat "$HOME/.sbyg-admin-token")" | curl -fsS --max-time 10 --config - -X POST "https://${snb}.${USERNAME}.serv00.net/up" >/dev/null 2>&1
+}
+servwebinstall(){
+local adminfile="$HOME/.sbyg-admin-token" tmp had_app=0
+if [[ ! -s "$adminfile" ]]; then
+(umask 077; openssl rand -hex 32 > "$adminfile") || return 1
+fi
+chmod 600 "$adminfile" || return 1
+cat > "$HOME/webrestart.sh" <<'RESTART'
+#!/bin/bash
+set -e
+name=$(whoami | tr '[:upper:]' '[:lower:]')
+cd "$HOME/domains/$name.serv00.net/logs"
+pkill -f 'run -c con' || true
+binary=$(cat sb.txt)
+[[ $binary =~ ^[A-Za-z0-9_-]+$ ]] || exit 1
+nohup "./$binary" run -c config.json >/dev/null 2>&1 &
+RESTART
+chmod 700 "$HOME/webrestart.sh"
+tmp=$(mktemp "$keep_path/.app.XXXXXXXX") || return 1
+if curl -fsSL --max-time 30 "$SBYG_SOURCE/app.js" -o "$tmp" && /usr/local/bin/node18 --check < "$tmp" >/dev/null 2>&1; then
+if cmp -s "$tmp" "$keep_path/app.js"; then
+rm -f "$tmp"
+return 0
+fi
+[[ -f "$keep_path/app.js" ]] && had_app=1
+mv -f "$tmp" "$keep_path/app.js" || return 1
+if [[ $had_app == 1 ]]; then
+devil www restart "${snb}.${USERNAME}.serv00.net" >/dev/null 2>&1 || return 1
+fi
+else
+rm -f "$tmp"
+return 1
+fi
+}
 devil binexec on >/dev/null 2>&1
 USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
 HOSTNAME=$(hostname)
@@ -31,8 +69,7 @@ bash -c 'ps aux | grep $(whoami) | grep -v "sshd\|bash\|grep" | awk "{print \$2}
 devil www list | awk 'NR > 1 && NF {print $1}' | xargs -I {} devil www del {} > /dev/null 2>&1
 sed -i '/export PATH="\$HOME\/bin:\$PATH"/d' "${HOME}/.bashrc" >/dev/null 2>&1
 source "${HOME}/.bashrc" >/dev/null 2>&1
-find ~ -type f -exec chmod 644 {} \; 2>/dev/null
-find ~ -type d -exec chmod 755 {} \; 2>/dev/null
+find ~ -type d -exec chmod u+rwx {} \; 2>/dev/null
 find ~ -type f -exec rm -f {} \; 2>/dev/null
 find ~ -type d -empty -exec rmdir {} \; 2>/dev/null
 find ~ -exec rm -rf {} \; 2>/dev/null
@@ -72,11 +109,7 @@ else
 echo "$UUID" > $WORKDIR/UUID.txt
 UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null)
 fi
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/app.js -o "$keep_path"/app.js
-sed -i '' "15s/name/$snb/g" "$keep_path"/app.js
-sed -i '' "59s/key/$UUID/g" "$keep_path"/app.js
-sed -i '' "90s/name/$USERNAME/g" "$keep_path"/app.js
-sed -i '' "90s/where/$snb/g" "$keep_path"/app.js
+servwebinstall || { red "管理网页更新失败"; exit 1; }
 if [[ -z "$reym" ]] && [[ -f "$WORKDIR/reym.txt" ]]; then
 reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null)
 elif [[ -z "$reym" ]] && [[ ! -f "$WORKDIR/reym.txt" ]]; then
@@ -113,7 +146,7 @@ sed -i '' -e "18s|'$vmp'|'$vmess_port'|" serv00keep.sh
 sed -i '' -e "19s|'$hyp'|'$hy2_port'|" serv00keep.sh
 ps aux | grep '[r]un -c con' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
 sleep 1
-curl -sk "http://${snb}.${USERNAME}.serv00.net/up" > /dev/null 2>&1
+bash "$HOME/webrestart.sh"
 sleep 5
 }
 
@@ -244,7 +277,7 @@ get_argodomain() {
 }
 
 if [ ! -f serv00keep.sh ]; then
-curl -sSL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/serv00keep.sh -o serv00keep.sh && chmod +x serv00keep.sh
+curl -sSL ${SBYG_SOURCE}/serv00keep.sh -o serv00keep.sh && chmod +x serv00keep.sh
 echo '#!/bin/bash
 red() { echo -e "\e[1;91m$1\033[0m"; }
 green() { echo -e "\e[1;32m$1\033[0m"; }
@@ -272,7 +305,7 @@ cd "$keep_path"
 npm install basic-auth express dotenv axios --silent > /dev/null 2>&1
 rm $HOME/domains/${snb}.${USERNAME}.serv00.net/public_nodejs/public/index.html > /dev/null 2>&1
 devil www restart ${snb}.${USERNAME}.serv00.net
-green "安装完毕，多功能主页地址：http://${snb}.${USERNAME}.serv00.net"
+green "安装完毕，多功能主页地址：https://${snb}.${USERNAME}.serv00.net"
 fi
 
 if [[ "$resport" =~ ^[Yy]$ ]]; then
@@ -1209,7 +1242,7 @@ EOF
 
 cat clash_meta.yaml > ${FILE_PATH}/${UUID}_clashmeta.txt
 cat sing_box.json > ${FILE_PATH}/${UUID}_singbox.txt
-curl -sL https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/index.html -o "$FILE_PATH"/index.html
+curl -sL ${SBYG_SOURCE}/index.html -o "$FILE_PATH"/index.html
 V2rayN_LINK="https://${USERNAME}.serv00.net/${UUID}_v2sub.txt"
 Clashmeta_LINK="https://${USERNAME}.serv00.net/${UUID}_clashmeta.txt"
 Singbox_LINK="https://${USERNAME}.serv00.net/${UUID}_singbox.txt"
@@ -1300,7 +1333,7 @@ Sing-box订阅分享链接：
 $Singbox_LINK
 -------------------------------------------------------------------------------------------------
 
-多功能主页地址：http://${snb}.${USERNAME}.serv00.net
+多功能主页地址：https://${snb}.${USERNAME}.serv00.net
 
 =================================================================================================
 

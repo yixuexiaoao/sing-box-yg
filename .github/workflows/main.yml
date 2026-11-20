@@ -1,48 +1,30 @@
-name: Parallel URL Fetch
-
+name: Authenticated Serv00 keepalive
 on:
- # schedule:
-#  - cron: '*/10 * * * *' # 每10分钟执行一次（公开库每月2000分钟运行时长，每天64分钟）
-  workflow_dispatch: 
-
+  # schedule:
+  #   - cron: "*/10 * * * *"
+  workflow_dispatch:
 permissions:
   contents: read
-
 jobs:
-  fetch-urls:
+  keepalive:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v5
-
-    - name: Fetch URLs in parallel
-      env:
-        HTTP_URLS: ${{ secrets.http }}
-      # secrets设置，变量名称：http
-      # 变量值要求：每个保活/up网页或每个重启/re网页之间用空格或者，或者,间隔开，网页前带http://
-      # 变量值填写示例：http://保活或重启网页1 http://保活或重启网页2 http://保活或重启网页3 ………
-      run: |
-        IFS=$',， ' read -r -a http <<< "$HTTP_URLS"
-         echo "*****************************************************"
-         echo "甬哥Github项目  ：github.com/yonggekkk"
-         echo "甬哥Blogger博客 ：ygkkk.blogspot.com"
-         echo "甬哥YouTube频道 ：www.youtube.com/@ygkkk"
-         echo "🎉Github定时运行serv00保活网页🎉"
-         echo "请先确认已成功安装甬哥的serv00的SSH脚本或者Github/VPS/软路由脚本"
-         echo "脚本地址：https://github.com/yonggekkk/sing-box-yg"
-         echo "*****************************************************"
-        for i in "${!http[@]}"; do
-          url=${http[i]}
-          if ! response=$(curl --disable -fsS --max-time 20 --proto '=http,https' -- "$url" 2>/dev/null); then
-            response=
-          fi
-          if [[ "$response" == *"网页保活启动"* ]]; then
-          echo "第 $((i + 1)) 个端点保活成功"
-          elif [[ "$response" == *"主程序重启成功"* ]]; then
-          echo "第 $((i + 1)) 个端点重启成功"
-          else
-          echo "第 $((i + 1)) 个端点请求失败或返回了未知状态"
-         fi
-        done
-        wait
+      - name: Call management endpoints
+        env:
+          HTTP_TARGETS: ${{ secrets.HTTP_TARGETS }}
+        run: |
+          set -euo pipefail
+          targets=$(jq -ce 'if type == "array" and length > 0 then .[] else error("invalid HTTP_TARGETS") end' <<< "$HTTP_TARGETS")
+          count=0
+          while IFS= read -r target; do
+            count=$((count+1))
+            url=$(jq -er '.url | select(type == "string")' <<< "$target")
+            token=$(jq -er '.token | select(type == "string" and test("^[a-f0-9]{64}$"))' <<< "$target")
+            [[ $url =~ ^https://[A-Za-z0-9.-]+/(up|re)$ ]] || { echo "第 $count 项 URL 格式错误"; exit 1; }
+            if printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -fsS --connect-timeout 10 --max-time 190 --config - -X POST "$url" >/dev/null 2>&1; then
+              echo "第 $count 项操作完成"
+            else
+              echo "第 $count 项操作失败"
+              exit 1
+            fi
+          done <<< "$targets"
