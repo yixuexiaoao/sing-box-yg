@@ -56,6 +56,10 @@ def check(c, msg):
     print(("PASS " if c else "FAIL ") + msg); fails += (not c)
 
 # ---------------- 1. collector accounting
+q = A.query_traffic({"timeline": True, "group": "hour"})
+check(q.get("buckets") == [] and q.get("truncated") is False and q["nic"]["sampled"] == 0,
+      "timeline without a database returns empty UTC buckets and zero NIC coverage")
+check(A.query_traffic({})["nic"]["sampled"] == 0, "legacy traffic response without database includes numeric NIC coverage")
 C = A.TrafficCollector()
 def conn(i, ip, host, up, down, typ="vless/vless-sb", chain="direct"):
     return {"id": str(i), "metadata": {"sourceIP": ip, "host": host, "type": typ, "destinationIP": "9.9.9.9"},
@@ -582,6 +586,64 @@ A.write(os.path.join(SB, "sing_box_gitlab.txt"), _gitlab_link)
 check(any(s["link"] == _gitlab_link for s in A.get_links()["subs"]), "GitLab subscription uses the configured separate read token")
 A.write(os.path.join(SB, "gitlabreadtoken.txt"), "")
 check(not any(s["name"].startswith("Gitlab") for s in A.get_links()["subs"]), "GitLab subscription requires a configured read token")
+# ---------------- UTC 时间序列使用真实 SQLite，与服务器本地分组保持独立
+_old_db, _old_ready = A.TRAFFIC_DB, A._DB_READY
+A.TRAFFIC_DB = os.path.join(SB, "timeline-test.db")
+A._DB_READY = False
+_start = H + 365 * 86400
+_con = A.db_connect()
+with _con:
+    _con.executemany("INSERT INTO traffic(hour,src,host,inbound,outbound,up,down,conns) VALUES(?,?,?,?,?,?,?,?)", [
+        (_start, "192.0.2.1", "a.example", "vless", "direct", 5, 10, 2),
+        (_start, "192.0.2.2", "b.example", "vless", "direct", 50, 100, 3),
+        (_start + 3600, "192.0.2.1", "c.example", "vmess", "proxy", 7, 11, 1),
+    ])
+    _con.executemany("INSERT INTO total(hour,up,down) VALUES(?,?,?)", [(_start, 100, 200), (_start + 10800, 700, 800)])
+    _con.executemany("INSERT INTO nic(hour,rx,tx) VALUES(?,?,?)", [(_start, 1000, 2000), (_start + 7200, 0, 0)])
+_con.close()
+_params = {"start": _start, "end": _start + 14400, "group": "hour", "timeline": True, "ip_exact": "192.0.2.1"}
+_timeline = A.query_traffic(_params)
+check([b["t"] for b in _timeline["buckets"]] == [_start + i * 3600 for i in range(4)]
+      and not _timeline["truncated"] and _timeline["rows"] == [],
+      "UTC timeline merges filtered proxy, total-only and NIC-only hours in chronological order")
+check(_timeline["buckets"][0] == {"t": _start, "up": 5, "down": 10, "conns": 2, "ips": 1, "hosts": 1,
+                                    "rx": 1000, "tx": 2000, "proxyUp": 100, "proxyDown": 200},
+      "UTC bucket keeps filtered proxy counts separate from whole-server totals and NIC bytes")
+check(_timeline["buckets"][1]["rx"] is None and _timeline["buckets"][1]["tx"] is None
+      and _timeline["buckets"][1]["proxyUp"] == 0 and _timeline["buckets"][1]["up"] == 7
+      and _timeline["buckets"][2]["rx"] == 0 and _timeline["buckets"][2]["tx"] == 0,
+      "UTC timeline distinguishes missing NIC samples from recorded zero traffic")
+check(_timeline["matched"] == {"up": 12, "down": 21, "conns": 3}
+      and _timeline["total"] == {"up": 800, "down": 1000} and _timeline["nic"]["sampled"] == 2,
+      "timeline summaries cover the selected window and report sampled NIC hours")
+_legacy = A.query_traffic({k: v for k, v in _params.items() if k != "timeline"})
+check("buckets" not in _legacy and "truncated" not in _legacy and len(_legacy["rows"]) == 2
+      and _legacy["matched"] == _timeline["matched"] and _legacy["nic"]["sampled"] == 2,
+      "ordinary local-hour traffic response preserves existing rows and summaries")
+_filtered = A.query_traffic(dict(_params, host="a.example", inbound="vless", outbound="direct"))
+check(_filtered["matched"]["up"] == 5 and _filtered["buckets"][1]["up"] == 0,
+      "timeline honors combined IP, host, inbound and outbound filters")
+_empty = A.query_traffic(dict(_params, start=_start + 14400, end=_start + 18000))
+check(_empty["buckets"] == [] and not _empty["truncated"] and _empty["nic"]["sampled"] == 0,
+      "empty selected window reports no timeline truncation or NIC coverage")
+_con = A.db_connect()
+with _con:
+    _con.execute("DELETE FROM traffic")
+    _con.execute("DELETE FROM total")
+    _con.execute("DELETE FROM nic")
+    _con.executemany("INSERT INTO total(hour,up,down) VALUES(?,?,?)", [(_start + i * 3600, 1, 2) for i in range(5001)])
+    _con.executemany("INSERT INTO nic(hour,rx,tx) VALUES(?,?,?)", [(_start + i * 3600, 3, 4) for i in range(5001)])
+_con.close()
+_long = A.query_traffic(dict(_params, end=_start + 5001 * 3600, limit=1))
+check(len(_long["buckets"]) == 5000 and _long["truncated"]
+      and _long["buckets"][0]["t"] == _start + 3600 and _long["buckets"][-1]["t"] == _start + 5000 * 3600,
+      "timeline retains the newest 5000 UTC hours and signals truncation independently of row limit")
+check(_long["total"] == {"up": 5001, "down": 10002} and _long["nic"]["sampled"] == 5001
+      and _long["nic"]["rx"] == 15003,
+      "truncated timeline retains full-window totals and NIC coverage")
+_boundary = A.query_traffic(dict(_params, end=_start + 5000 * 3600))
+check(len(_boundary["buckets"]) == 5000 and not _boundary["truncated"], "exactly 5000 UTC hours are complete")
+A.TRAFFIC_DB, A._DB_READY = _old_db, _old_ready
 os.remove(A.API_CONF)
 shutil.rmtree(T, ignore_errors=True)
 print("FAILS:", fails); sys.exit(1 if fails else 0)

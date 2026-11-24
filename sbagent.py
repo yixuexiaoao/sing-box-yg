@@ -42,7 +42,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -1512,9 +1512,14 @@ def traffic_range(p):
 def query_traffic(p):
     if COLLECTOR is not None:
         COLLECTOR.flush()
+    timeline = p.get("timeline") is True
     if not os.path.exists(TRAFFIC_DB):
-        return {"enabled": traffic_enabled(), "rows": [], "total": {"up": 0, "down": 0},
-                "matched": {"up": 0, "down": 0, "conns": 0}, "nic": {"rx": 0, "tx": 0, "since": ""}, "range": []}
+        result = {"enabled": traffic_enabled(), "rows": [], "total": {"up": 0, "down": 0},
+                  "matched": {"up": 0, "down": 0, "conns": 0},
+                  "nic": {"rx": 0, "tx": 0, "since": "", "sampled": 0}, "range": []}
+        if timeline:
+            result.update(buckets=[], truncated=False)
+        return result
     start, end = traffic_range(p)
     group = p.get("group") or "ip"
     if group not in TRAFFIC_GROUPS:
@@ -1537,26 +1542,46 @@ def query_traffic(p):
     order = "k" if group in ("day", "hour", "month") else sort
     w = " AND ".join(where)
     con = db_connect()
+    buckets = []
     try:
-        rows = con.execute("SELECT %s AS k, SUM(up) AS up, SUM(down) AS down, SUM(conns), COUNT(DISTINCT src),"
-                           " COUNT(DISTINCT host), MIN(hour), MAX(hour) FROM traffic WHERE %s GROUP BY k ORDER BY %s LIMIT ?"
-                           % (key, w, order), args + [limit]).fetchall()
+        con.execute("BEGIN")  # 同一响应的小时序列、筛选合计及网卡覆盖使用同一快照
+        rows = []
+        if timeline:
+            buckets = con.execute(
+                "WITH matched AS (SELECT hour, SUM(up) AS up, SUM(down) AS down, SUM(conns) AS conns,"
+                " COUNT(DISTINCT src) AS ips, COUNT(DISTINCT host) AS hosts FROM traffic WHERE " + w +
+                " GROUP BY hour), hours AS (SELECT hour FROM matched UNION SELECT hour FROM total"
+                " WHERE hour >= ? AND hour < ? UNION SELECT hour FROM nic WHERE hour >= ? AND hour < ?)"
+                " SELECT hours.hour, COALESCE(matched.up, 0), COALESCE(matched.down, 0),"
+                " COALESCE(matched.conns, 0), COALESCE(matched.ips, 0), COALESCE(matched.hosts, 0),"
+                " nic.rx, nic.tx, COALESCE(total.up, 0), COALESCE(total.down, 0) FROM hours"
+                " LEFT JOIN matched ON matched.hour = hours.hour LEFT JOIN nic ON nic.hour = hours.hour"
+                " LEFT JOIN total ON total.hour = hours.hour ORDER BY hours.hour DESC LIMIT ?",
+                args + [start, end, start, end, 5001]).fetchall()
+        else:
+            rows = con.execute("SELECT %s AS k, SUM(up) AS up, SUM(down) AS down, SUM(conns), COUNT(DISTINCT src),"
+                               " COUNT(DISTINCT host), MIN(hour), MAX(hour) FROM traffic WHERE %s GROUP BY k ORDER BY %s LIMIT ?"
+                               % (key, w, order), args + [limit]).fetchall()
         m = con.execute("SELECT SUM(up), SUM(down), SUM(conns) FROM traffic WHERE " + w, args).fetchone()
         t = con.execute("SELECT SUM(up), SUM(down) FROM total WHERE hour >= ? AND hour < ?", (start, end)).fetchone()
-        n = con.execute("SELECT SUM(rx), SUM(tx), MIN(hour) FROM nic WHERE hour >= ? AND hour < ?", (start, end)).fetchone()
+        n = con.execute("SELECT SUM(rx), SUM(tx), COUNT(*) FROM nic WHERE hour >= ? AND hour < ?", (start, end)).fetchone()
         n0 = con.execute("SELECT MIN(hour) FROM nic").fetchone()
     finally:
         con.close()
-    return {
+    result = {
         "enabled": traffic_enabled(), "group": group, "range": [fmt_ts(start), fmt_ts(end)],
         "rows": [{"key": r[0], "up": r[1] or 0, "down": r[2] or 0, "conns": r[3] or 0, "ips": r[4], "hosts": r[5],
                   "first": fmt_ts(r[6]), "last": fmt_ts(r[7] + 3599)} for r in rows],
         "matched": {"up": m[0] or 0, "down": m[1] or 0, "conns": m[2] or 0},
         "total": {"up": t[0] or 0, "down": t[1] or 0},
-        "nic": {"rx": n[0] or 0, "tx": n[1] or 0, "since": fmt_ts(n0[0]) if n0 and n0[0] else ""},
+        "nic": {"rx": n[0] or 0, "tx": n[1] or 0, "since": fmt_ts(n0[0]) if n0 and n0[0] else "", "sampled": n[2]},
         "tzoff": utc_offset(),  # 日期/小时分组键使用服务器本地时间，面板据此换算
         "collector": COLLECTOR.error if COLLECTOR is not None else None,
     }
+    if timeline:
+        fields = ("t", "up", "down", "conns", "ips", "hosts", "rx", "tx", "proxyUp", "proxyDown")
+        result.update(buckets=[dict(zip(fields, row)) for row in reversed(buckets[:5000])], truncated=len(buckets) > 5000)
+    return result
 
 
 def purge_traffic(p):
