@@ -315,6 +315,8 @@ except ValueError:
 # ---------------- 6. 远程升级：只用内置地址；校验失败不替换；成功则替换并备份
 import http.server as _hs
 files = {}
+responses = {}
+attempts = {}
 
 
 class _H(_hs.BaseHTTPRequestHandler):
@@ -322,6 +324,14 @@ class _H(_hs.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        attempts[self.path] = attempts.get(self.path, 0) + 1
+        statuses = responses.get(self.path)
+        if statuses:
+            status = statuses.pop(0)
+            self.send_response(status, "Backend.max_conn reached" if status == 503 else None)
+            self.send_header("Retry-After", "0")
+            self.end_headers()
+            return
         body = files.get(self.path)
         self.send_response(200 if body is not None else 404)
         self.end_headers()
@@ -337,6 +347,25 @@ new_agent = open(AGENT, "rb").read().replace(b'VERSION = "' + A.VERSION.encode()
 open(A.SB_SCRIPT, "wb").write(b"#!/bin/bash\n# old\n")
 before_agent = open(AGENT, "rb").read()
 ver = "v99.1更新内容：\nx".encode()
+files.update({"/sb.sh": good_sb, "/sbagent.py": new_agent, "/version": ver})
+responses["/sb.sh"] = [503, 503, 503]
+try:
+    A.do_upgrade()
+    check(False, "persistent upgrade download 503 stops after three attempts")
+except RuntimeError as e:
+    check("HTTP 503" in str(e) and attempts["/sb.sh"] == 3 and
+          open(A.SB_SCRIPT, "rb").read() == b"#!/bin/bash\n# old\n" and
+          open(AGENT, "rb").read() == before_agent,
+          "persistent upgrade download 503 stops after three attempts and keeps old files")
+try:
+    A.http_get(A.UPDATE_BASE + "/missing")
+    check(False, "missing upgrade file is not retried")
+except A.urllib.error.HTTPError as e:
+    check(e.code == 404 and attempts["/missing"] == 1, "missing upgrade file is not retried")
+files["/retry"] = b"recovered"
+responses["/retry"] = [503, 502]
+check(A.http_get(A.UPDATE_BASE + "/retry") == b"recovered" and attempts["/retry"] == 3,
+      "temporary download error recovers on the third attempt")
 for label, sb, ag in (("bad script", b"not a script", new_agent),
                       ("script syntax error", b"#!/bin/bash\nsbrepo=x\nif then fi\n", new_agent),
                       ("agent syntax error", good_sb, b'VERSION = "9.9.9"\ndef serve(:\n')):

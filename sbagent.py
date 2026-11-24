@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, urlsplit
 import uuid as uuidlib
@@ -42,7 +43,7 @@ try:
 except ImportError:  # 极少数精简系统的 python3 不带 sqlite3，流量统计不可用
     sqlite3 = None
 
-VERSION = "1.4.9"
+VERSION = "1.4.10"
 START_TS = time.time()  # 进程启动时间：重启后拒绝启动前签发的请求（内存中的 nonce 表已清空，防止重放）
 UPDATE_BASE = os.environ.get("SB_UPDATE_BASE", "https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main")
 SB_SCRIPT = os.environ.get("SB_SCRIPT", "/usr/bin/sb")
@@ -1621,8 +1622,23 @@ UPGRADE_LOCK = threading.Lock()
 
 def http_get(url, limit=8 * 1024 * 1024):
     req = urllib.request.Request(url, headers={"User-Agent": "sbagent/" + VERSION})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = r.read(limit + 1)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read(limit + 1)
+            break
+        except urllib.error.HTTPError as e:
+            e.close()
+            if e.code not in (429, 502, 503, 504):
+                raise
+            if attempt == 2:
+                raise RuntimeError("下载源暂时繁忙（HTTP %d，已尝试 3 次）：%s" %
+                                   (e.code, urlsplit(url).hostname)) from e
+            delay = 2 ** attempt + secrets.randbelow(1000) / 1000
+            retry_after = e.headers.get("Retry-After", "") if e.headers else ""
+            if re.fullmatch(r"[0-9]{1,5}", retry_after):
+                delay = min(5, int(retry_after))
+            time.sleep(delay)
     if len(data) > limit:
         raise RuntimeError("下载内容过大：" + url)
     return data
